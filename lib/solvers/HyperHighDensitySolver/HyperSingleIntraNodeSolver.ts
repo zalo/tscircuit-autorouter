@@ -14,12 +14,14 @@ import { SingleTransitionCrossingRouteSolver } from "../HighDensitySolver/TwoRou
 import { SingleTransitionIntraNodeSolver } from "../HighDensitySolver/SingleTransitionIntraNodeSolver"
 import { MultiHeadPolyLineIntraNodeSolver2 } from "../HighDensitySolver/MultiHeadPolyLineIntraNodeSolver/MultiHeadPolyLineIntraNodeSolver2_Optimized"
 import { MultiHeadPolyLineIntraNodeSolver3 } from "../HighDensitySolver/MultiHeadPolyLineIntraNodeSolver/MultiHeadPolyLineIntraNodeSolver3_ViaPossibilitiesSolverIntegration"
+import { GreedyDescentCrossingViasSolver } from "../HighDensitySolver/GreedyDescentCrossingViasSolver"
 
 export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
   | IntraNodeRouteSolver
   | TwoCrossingRoutesHighDensitySolver
   | SingleTransitionCrossingRouteSolver
   | SingleTransitionIntraNodeSolver
+  | GreedyDescentCrossingViasSolver
 > {
   override getSolverName(): string {
     return "HyperSingleIntraNodeSolver"
@@ -44,6 +46,7 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
 
   getCombinationDefs() {
     return [
+      ["greedyDescentCrossingVias"],
       ["multiHeadPolyLine"],
       ["majorCombinations", "orderings6", "cellSizeFactor"],
       ["noVias"],
@@ -157,6 +160,14 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
         ],
       },
       {
+        name: "greedyDescentCrossingVias",
+        possibleValues: [
+          {
+            GREEDY_DESCENT_CROSSING_VIAS: true,
+          },
+        ],
+      },
+      {
         name: "multiHeadPolyLine",
         possibleValues: [
           {
@@ -195,6 +206,12 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
   }
 
   generateSolver(hyperParameters: any): IntraNodeRouteSolver {
+    if (hyperParameters.GREEDY_DESCENT_CROSSING_VIAS) {
+      return new GreedyDescentCrossingViasSolver({
+        nodeWithPortPoints: this.nodeWithPortPoints,
+        viaDiameter: this.constructorParams.viaDiameter,
+      }) as any
+    }
     if (hyperParameters.CLOSED_FORM_TWO_TRACE_SAME_LAYER) {
       return new TwoCrossingRoutesHighDensitySolver({
         nodeWithPortPoints: this.nodeWithPortPoints,

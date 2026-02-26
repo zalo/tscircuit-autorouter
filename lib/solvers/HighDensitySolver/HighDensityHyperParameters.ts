@@ -51,4 +51,7 @@ export interface HighDensityHyperParameters {
 
   // Minimum travel distance before allowing jumper neighbors
   MIN_TRAVEL_BEFORE_JUMPER?: number // mm - default: 3
+
+  // Whether to use the greedy descent with crossing vias solver
+  GREEDY_DESCENT_CROSSING_VIAS?: boolean
 }

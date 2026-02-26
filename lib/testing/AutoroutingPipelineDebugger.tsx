@@ -36,6 +36,7 @@ import {
 } from "./AutoroutingPipelineMenuBar"
 import { AssignableAutoroutingPipeline2 } from "lib/autorouter-pipelines/AssignableAutoroutingPipeline2/AssignableAutoroutingPipeline2"
 import { AssignableAutoroutingPipeline3 } from "lib/autorouter-pipelines/AssignableAutoroutingPipeline3/AssignableAutoroutingPipeline3"
+import { PolyanyaPipelineSolver } from "lib/autorouter-pipelines/PolyanyaPipeline/PolyanyaPipelineSolver"
 
 const PIPELINE_SOLVERS = {
   AutoroutingPipelineSolver2_PortPointPathing,
@@ -44,6 +45,7 @@ const PIPELINE_SOLVERS = {
   AssignableAutoroutingPipeline2,
   AssignableAutoroutingPipeline3,
   AutoroutingPipeline1_OriginalUnravel,
+  PolyanyaPipelineSolver,
 } as const
 
 const PIPELINE_STORAGE_KEY = "selectedPipeline"
