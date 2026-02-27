@@ -55,6 +55,10 @@ export const PIPELINE_OPTIONS = [
     id: "PolyanyaPipelineSolver",
     label: "Polyanya Navmesh Pipeline",
   },
+  {
+    id: "CrossingRepulsionPipelineSolver",
+    label: "Crossing Repulsion Pipeline",
+  },
 ] as const
 
 export type PipelineId = (typeof PIPELINE_OPTIONS)[number]["id"]

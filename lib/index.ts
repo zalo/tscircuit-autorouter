@@ -17,6 +17,7 @@ export * from "./cache/types"
 export * from "./autorouter-pipelines/AssignableAutoroutingPipeline1/AssignableAutoroutingPipeline1Solver"
 export { convertSrjToGraphicsObject } from "./utils/convertSrjToGraphicsObject"
 export { PolyanyaPipelineSolver } from "./autorouter-pipelines/PolyanyaPipeline/PolyanyaPipelineSolver"
+export { CrossingRepulsionPipelineSolver } from "./autorouter-pipelines/CrossingRepulsionPipeline/CrossingRepulsionPipelineSolver"
 
 // Jumper-based solvers for single-layer PCBs
 export { IntraNodeSolverWithJumpers } from "./solvers/HighDensitySolver/IntraNodeSolverWithJumpers"

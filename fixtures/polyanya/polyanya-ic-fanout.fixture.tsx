@@ -1,5 +1,5 @@
 import { AutoroutingPipelineDebugger } from "lib/testing/AutoroutingPipelineDebugger"
-import { PolyanyaPipelineSolver } from "lib/autorouter-pipelines/PolyanyaPipeline/PolyanyaPipelineSolver"
+import { CrossingRepulsionPipelineSolver } from "lib/autorouter-pipelines/CrossingRepulsionPipeline/CrossingRepulsionPipelineSolver"
 import type { SimpleRouteJson } from "lib/types"
 
 // Simulates an IC package fanout: central IC body with 8 pads
@@ -66,7 +66,7 @@ const simpleRouteJson: SimpleRouteJson = {
 
 export default () => (
   <AutoroutingPipelineDebugger
-    createSolver={(srj) => new PolyanyaPipelineSolver(srj)}
+    createSolver={(srj) => new CrossingRepulsionPipelineSolver(srj)}
     srj={simpleRouteJson as any}
   />
 )

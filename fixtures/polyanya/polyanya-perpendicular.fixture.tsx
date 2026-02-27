@@ -1,5 +1,5 @@
 import { AutoroutingPipelineDebugger } from "lib/testing/AutoroutingPipelineDebugger"
-import { PolyanyaPipelineSolver } from "lib/autorouter-pipelines/PolyanyaPipeline/PolyanyaPipelineSolver"
+import { CrossingRepulsionPipelineSolver } from "lib/autorouter-pipelines/CrossingRepulsionPipeline/CrossingRepulsionPipelineSolver"
 import type { SimpleRouteJson } from "lib/types"
 
 // 2 traces crossing at ~90° — tests via insertion for perpendicular crossings
@@ -28,7 +28,7 @@ const simpleRouteJson: SimpleRouteJson = {
 
 export default () => (
   <AutoroutingPipelineDebugger
-    createSolver={(srj) => new PolyanyaPipelineSolver(srj)}
+    createSolver={(srj) => new CrossingRepulsionPipelineSolver(srj)}
     srj={simpleRouteJson as any}
   />
 )

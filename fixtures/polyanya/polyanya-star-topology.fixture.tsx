@@ -1,5 +1,5 @@
 import { AutoroutingPipelineDebugger } from "lib/testing/AutoroutingPipelineDebugger"
-import { PolyanyaPipelineSolver } from "lib/autorouter-pipelines/PolyanyaPipeline/PolyanyaPipelineSolver"
+import { CrossingRepulsionPipelineSolver } from "lib/autorouter-pipelines/CrossingRepulsionPipeline/CrossingRepulsionPipelineSolver"
 import type { SimpleRouteJson } from "lib/types"
 
 // Star topology: all traces converge toward a central region,
@@ -38,7 +38,7 @@ const simpleRouteJson = {
 
 export default () => (
   <AutoroutingPipelineDebugger
-    createSolver={(srj) => new PolyanyaPipelineSolver(srj)}
+    createSolver={(srj) => new CrossingRepulsionPipelineSolver(srj)}
     srj={simpleRouteJson as any}
   />
 )

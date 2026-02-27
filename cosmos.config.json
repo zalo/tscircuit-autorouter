@@ -1,4 +1,6 @@
 {
   "plugins": ["react-cosmos-plugin-vite"],
-  "lazy": true
+  "lazy": true,
+  "hostname": "0.0.0.0",
+  "rendererUrl": "http://10.0.0.76:5050/"
 }
