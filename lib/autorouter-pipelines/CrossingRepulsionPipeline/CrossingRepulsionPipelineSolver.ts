@@ -15,6 +15,7 @@ import { PolyanyaMeshSolver } from "../../solvers/PolyanyaSolver/PolyanyaMeshSol
 import { PolyanyaPathSolver } from "../../solvers/PolyanyaSolver/PolyanyaPathSolver"
 import { CrossingRepulsionSolver } from "../../solvers/PolyanyaSolver/CrossingRepulsionSolver"
 import { PolyanyaOutputSolver } from "../../solvers/PolyanyaSolver/PolyanyaOutputSolver"
+import { GreedySequentialPathSolver } from "../../solvers/PolyanyaSolver/GreedySequentialPathSolver"
 
 type PipelineStep<T extends new (...args: any[]) => BaseSolver> = {
   solverName: string
@@ -50,6 +51,7 @@ export class CrossingRepulsionPipelineSolver extends BaseSolver {
   }
 
   netToPointPairsSolver?: NetToPointPairsSolver2_OffBoardConnection
+  greedySolver?: GreedySequentialPathSolver
   meshSolver?: PolyanyaMeshSolver
   pathSolver?: PolyanyaPathSolver
   crossingResolver?: CrossingRepulsionSolver
@@ -58,6 +60,8 @@ export class CrossingRepulsionPipelineSolver extends BaseSolver {
   colorMap: Record<string, string>
   connMap: ConnectivityMap
   srjWithPointPairs?: SimpleRouteJson
+  /** SRJ with only the unrouted connections (for fallback pipeline) */
+  srjForFallback?: SimpleRouteJson
   viaDiameter: number
   minTraceWidth: number
 
@@ -68,6 +72,7 @@ export class CrossingRepulsionPipelineSolver extends BaseSolver {
   activeSubSolver?: BaseSolver | null = null
 
   pipelineDef = [
+    // Step 1: Net-to-point-pairs
     definePipelineStep(
       "netToPointPairsSolver",
       NetToPointPairsSolver2_OffBoardConnection,
@@ -83,26 +88,58 @@ export class CrossingRepulsionPipelineSolver extends BaseSolver {
         },
       },
     ),
+    // Step 2: Greedy sequential solver — routes as many traces as it can
+    definePipelineStep(
+      "greedySolver",
+      GreedySequentialPathSolver,
+      (pps) => [
+        {
+          srj: pps.srjWithPointPairs ?? pps.srj,
+          colorMap: pps.colorMap,
+          minTraceWidth: pps.minTraceWidth,
+          margin: pps.srj.defaultObstacleMargin ?? pps.minTraceWidth,
+        },
+      ],
+      {
+        onSolved: (pps) => {
+          // Build a reduced SRJ with only unrouted connections for fallback
+          const unrouted = new Set(pps.greedySolver!.getUnroutedConnectionNames())
+          if (unrouted.size === 0) {
+            // Everything routed — skip the fallback pipeline
+            pps.srjForFallback = undefined
+          } else {
+            const baseSrj = pps.srjWithPointPairs ?? pps.srj
+            pps.srjForFallback = {
+              ...baseSrj,
+              connections: baseSrj.connections.filter((c) => unrouted.has(c.name)),
+            }
+          }
+        },
+      },
+    ),
+    // Step 3: Mesh solver for unrouted connections (skipped if all routed)
     definePipelineStep(
       "meshSolver",
       PolyanyaMeshSolver,
       (pps) => [
-        pps.srjWithPointPairs ?? pps.srj,
+        pps.srjForFallback ?? pps.srjWithPointPairs ?? pps.srj,
         pps.srj.defaultObstacleMargin ?? pps.minTraceWidth,
       ],
     ),
+    // Step 4: Path solver for unrouted connections
     definePipelineStep(
       "pathSolver",
       PolyanyaPathSolver,
       (pps) => [
         {
           mesh: pps.meshSolver!.getMesh(),
-          srj: pps.srjWithPointPairs ?? pps.srj,
+          srj: pps.srjForFallback ?? pps.srjWithPointPairs ?? pps.srj,
           colorMap: pps.colorMap,
           minTraceWidth: pps.minTraceWidth,
         },
       ],
     ),
+    // Step 5: Crossing repulsion for unrouted connections
     definePipelineStep(
       "crossingResolver",
       CrossingRepulsionSolver,
@@ -110,7 +147,7 @@ export class CrossingRepulsionPipelineSolver extends BaseSolver {
         {
           paths: pps.pathSolver!.getResults(),
           mesh: pps.meshSolver!.getMesh(),
-          srj: pps.srjWithPointPairs ?? pps.srj,
+          srj: pps.srjForFallback ?? pps.srjWithPointPairs ?? pps.srj,
           colorMap: pps.colorMap,
           minTraceWidth: pps.minTraceWidth,
           layerCount: pps.srj.layerCount,
@@ -118,17 +155,27 @@ export class CrossingRepulsionPipelineSolver extends BaseSolver {
         },
       ],
     ),
+    // Step 6: Output — merge greedy results + crossing repulsion results
     definePipelineStep(
       "outputSolver",
       PolyanyaOutputSolver,
-      (pps) => [
-        {
-          resolvedPaths: pps.crossingResolver!.getResolvedPaths(),
-          srj: pps.srjWithPointPairs ?? pps.srj,
-          minTraceWidth: pps.minTraceWidth,
-          viaDiameter: pps.viaDiameter,
-        },
-      ],
+      (pps) => {
+        const baseSrj = pps.srjWithPointPairs ?? pps.srj
+        const greedyPaths = pps.greedySolver?.getResolvedPaths() ?? []
+        const fallbackPaths = pps.crossingResolver?.getResolvedPaths() ?? []
+        const allPaths = [...greedyPaths, ...fallbackPaths]
+        const effectiveLayerCount = pps.greedySolver?.getEffectiveLayerCount() ?? pps.srj.layerCount
+        return [
+          {
+            resolvedPaths: allPaths,
+            srj: baseSrj.layerCount >= effectiveLayerCount
+              ? baseSrj
+              : { ...baseSrj, layerCount: effectiveLayerCount },
+            minTraceWidth: pps.minTraceWidth,
+            viaDiameter: pps.viaDiameter,
+          },
+        ]
+      },
     ),
   ]
 
@@ -154,6 +201,18 @@ export class CrossingRepulsionPipelineSolver extends BaseSolver {
     const pipelineStepDef = this.pipelineDef[this.currentPipelineStepIndex]
     if (!pipelineStepDef) {
       this.solved = true
+      return
+    }
+
+    // Skip fallback steps (mesh/path/crossingResolver) if greedy routed everything
+    if (
+      !this.srjForFallback &&
+      this.greedySolver &&
+      (pipelineStepDef.solverName === "meshSolver" ||
+        pipelineStepDef.solverName === "pathSolver" ||
+        pipelineStepDef.solverName === "crossingResolver")
+    ) {
+      this.currentPipelineStepIndex++
       return
     }
 
@@ -195,8 +254,10 @@ export class CrossingRepulsionPipelineSolver extends BaseSolver {
   }
 
   getOutputSimpleRouteJson(): SimpleRouteJson {
+    const effectiveLayerCount = this.greedySolver?.getEffectiveLayerCount() ?? this.srj.layerCount
     return {
       ...this.srj,
+      layerCount: Math.max(this.srj.layerCount, effectiveLayerCount),
       traces: this.getOutputSimplifiedPcbTraces(),
     }
   }
@@ -205,6 +266,7 @@ export class CrossingRepulsionPipelineSolver extends BaseSolver {
     if (!this.solved && this.activeSubSolver)
       return this.activeSubSolver.visualize()
 
+    const greedyViz = this.greedySolver?.visualize()
     const meshViz = this.meshSolver?.visualize()
     const pathViz = this.pathSolver?.visualize()
     const crossingViz = this.crossingResolver?.visualize()
@@ -245,6 +307,7 @@ export class CrossingRepulsionPipelineSolver extends BaseSolver {
 
     const visualizations = [
       problemViz,
+      greedyViz,
       meshViz,
       pathViz,
       crossingViz,
@@ -261,13 +324,13 @@ export class CrossingRepulsionPipelineSolver extends BaseSolver {
   }
 
   preview(): GraphicsObject {
-    if (this.pathSolver) {
+    if (this.greedySolver) {
       const lines: Line[] = []
-      for (const result of this.pathSolver.results) {
-        if (result.path.length > 1) {
+      for (const rp of this.greedySolver.getResolvedPaths()) {
+        if (rp.route.length > 1) {
           lines.push({
-            points: result.path.map((p) => ({ x: p.x, y: p.y })),
-            strokeColor: this.colorMap[result.connectionName],
+            points: rp.route.map((p) => ({ x: p.x, y: p.y })),
+            strokeColor: this.colorMap[rp.connectionName],
           })
         }
         if (lines.length > 200) break

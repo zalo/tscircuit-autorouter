@@ -62,14 +62,35 @@ export function mergeOverlappingRects(polygons: Point[][]): Point[][] {
     return { minX, minY, maxX, maxY }
   })
 
-  // Group overlapping AABBs using union-find
+  // Group overlapping AABBs using union-find + sweep line on X axis.
+  // Sort by minX, then sweep: for each rect, only check rects whose
+  // minX < current maxX (active set). Remove expired rects as we go.
   const uf = new UnionFind(aabbs.length)
-  for (let i = 0; i < aabbs.length; i++) {
-    for (let j = i + 1; j < aabbs.length; j++) {
-      if (aabbsOverlap(aabbs[i]!, aabbs[j]!)) {
+  const order = Array.from({ length: aabbs.length }, (_, i) => i)
+  order.sort((a, b) => aabbs[a]!.minX - aabbs[b]!.minX)
+
+  // Active set: indices sorted by maxX (earliest expiry first)
+  const active: number[] = []
+
+  for (const i of order) {
+    const ai = aabbs[i]!
+    // Remove expired rects from active set
+    let writeIdx = 0
+    for (let k = 0; k < active.length; k++) {
+      if (aabbs[active[k]!]!.maxX > ai.minX) {
+        active[writeIdx++] = active[k]!
+      }
+    }
+    active.length = writeIdx
+
+    // Check overlap with all active rects
+    for (let k = 0; k < active.length; k++) {
+      const j = active[k]!
+      if (aabbsOverlap(ai, aabbs[j]!)) {
         uf.union(i, j)
       }
     }
+    active.push(i)
   }
 
   // Collect groups

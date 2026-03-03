@@ -4,6 +4,7 @@ import {
   type Point,
   type WeightedRegion,
   VisibilityGraph,
+  SearchInstance,
   cdtTriangulate,
   rectToPolygon,
   buildMeshFromRegions,
@@ -17,6 +18,7 @@ import { mergeOverlappingRects } from "./mergeOverlappingRects"
 const TRACE_WEIGHT = 10
 const TRACE_PENALTY = 25
 
+// Phase ordering: shortest-first by default, longest-first available as option
 type Phase = "shortest" | "longest" | "done"
 
 /**
@@ -32,7 +34,8 @@ type Phase = "shortest" | "longest" | "done"
  * it triggers the shortest→longest phase fallback.
  *
  * Tries shortest-first ordering. If it gets stuck, resets and tries
- * longest-first, then keeps whichever routed more traces.
+ * longest-first, then keeps whichever routed more traces. When stuck
+ * on all layers, adds a new layer (up to maxLayerCount) before giving up.
  */
 export class GreedySequentialPathSolver extends BaseSolver {
   private srj: SimpleRouteJson
@@ -46,6 +49,10 @@ export class GreedySequentialPathSolver extends BaseSolver {
    *  rebuilt after each trace. When false, traces become weighted regions
    *  and the mesh is built once. */
   private useObstacles: boolean
+
+  /** When true, use Polyanya SearchInstance for pathfinding (no weighted
+   *  regions). When false, use VisibilityGraph (supports weighted regions). */
+  private usePolyanya: boolean
 
   /** All connections (immutable reference for resets) */
   private allConnections: Array<{
@@ -97,9 +104,12 @@ export class GreedySequentialPathSolver extends BaseSolver {
   /** Current ordering phase */
   private phase: Phase = "shortest"
 
-  /** Saved shortest-first results for comparison */
-  private shortestResults: ResolvedPath[] | null = null
-  private shortestObstaclePolys: typeof this.traceObstaclePolys | null = null
+  /** Best results across all phases */
+  private bestResults: ResolvedPath[] | null = null
+  private bestObstaclePolys: typeof this.traceObstaclePolys | null = null
+
+  /** Maximum layers allowed by the SRJ */
+  private maxLayerCount: number
 
   /** Points shared by multiple connections (no endcap clearance here) */
   private sharedPoints: Set<string>
@@ -117,6 +127,7 @@ export class GreedySequentialPathSolver extends BaseSolver {
     minTraceWidth: number
     margin: number
     useObstacles?: boolean
+    usePolyanya?: boolean
   }) {
     super()
     this.srj = params.srj
@@ -124,16 +135,17 @@ export class GreedySequentialPathSolver extends BaseSolver {
     this.minTraceWidth = params.minTraceWidth
     this.margin = params.margin
     this.useObstacles = params.useObstacles ?? true
-    this.layerCount = Math.max(2, params.srj.layerCount ?? 2)
+    this.usePolyanya = params.usePolyanya ?? true
+    this.maxLayerCount = Math.max(1, params.srj.layerCount ?? 2)
+    this.layerCount = 1 // Start with 1 layer, expand when stuck
     this.viaDiameter = params.srj.minViaDiameter ?? 0.6
 
-    // Map layer z-index to layer name for obstacle filtering
-    const layerNames = this.getLayerNames()
-
-    // Build per-layer base obstacle polygons from SRJ
+    // Build per-layer base obstacle polygons for ALL possible layers upfront
+    // (so layer names remain stable when layerCount grows dynamically)
+    const allLayerNames = this.getAllLayerNames()
     this.baseObstaclePolygons = []
-    for (let z = 0; z < this.layerCount; z++) {
-      const layerName = layerNames[z]!
+    for (let z = 0; z < this.maxLayerCount; z++) {
+      const layerName = allLayerNames[z]!
       const layerObstacles = params.srj.obstacles.filter((obs) =>
         obs.layers.includes(layerName),
       )
@@ -149,13 +161,13 @@ export class GreedySequentialPathSolver extends BaseSolver {
       this.baseObstaclePolygons.push(expandedPolygons)
     }
 
-    // Initialize per-layer state
-    this.rectObstacles = this.baseObstaclePolygons.map((polys) => [...polys])
+    // Initialize per-layer state (only for active layers)
+    this.rectObstacles = this.baseObstaclePolygons.slice(0, this.layerCount).map((polys) => [...polys])
     this.tracePolygonObstacles = Array.from({ length: this.layerCount }, () => [])
     this.traceWeightedRegions = Array.from({ length: this.layerCount }, () => [])
     this.meshes = Array.from({ length: this.layerCount }, () => null)
 
-    // Build meshes for all layers
+    // Build meshes for active layers only
     for (let z = 0; z < this.layerCount; z++) {
       this.buildMesh(z)
     }
@@ -192,17 +204,22 @@ export class GreedySequentialPathSolver extends BaseSolver {
 
     this.remaining = [...this.allConnections]
     this.totalConnections = this.remaining.length
-    this.MAX_ITERATIONS = this.totalConnections * 3 + 10
+    this.MAX_ITERATIONS = Math.max(500, this.totalConnections * 10)
   }
 
-  private getLayerNames(): string[] {
+  /** Layer names based on maxLayerCount (stable even as layerCount grows) */
+  private getAllLayerNames(): string[] {
     const names: string[] = []
-    for (let z = 0; z < this.layerCount; z++) {
+    for (let z = 0; z < this.maxLayerCount; z++) {
       if (z === 0) names.push("top")
-      else if (z === this.layerCount - 1) names.push("bottom")
+      else if (z === this.maxLayerCount - 1) names.push("bottom")
       else names.push(`inner${z}`)
     }
     return names
+  }
+
+  private getLayerNames(): string[] {
+    return this.getAllLayerNames().slice(0, this.layerCount)
   }
 
   /** Max total obstacle vertices before we skip mesh rebuild (OOM guard) */
@@ -342,9 +359,10 @@ export class GreedySequentialPathSolver extends BaseSolver {
 
   /** Reset routing state back to initial (no committed traces) */
   private resetState() {
-    this.rectObstacles = this.baseObstaclePolygons.map((polys) => [...polys])
+    this.rectObstacles = this.baseObstaclePolygons.slice(0, this.layerCount).map((polys) => [...polys])
     this.tracePolygonObstacles = Array.from({ length: this.layerCount }, () => [])
     this.traceWeightedRegions = Array.from({ length: this.layerCount }, () => [])
+    this.meshes = Array.from({ length: this.layerCount }, () => null)
     this.resolvedPaths = []
     this.traceObstaclePolys = []
     this.remaining = [...this.allConnections]
@@ -388,38 +406,6 @@ export class GreedySequentialPathSolver extends BaseSolver {
 
     return regions
   }
-
-  // /**
-  //  * Convert a polyline path into hard obstacle polygons (axis-aligned rects)
-  //  * placed along each segment.
-  //  */
-  // private pathToObstaclePolygons(
-  //   path: Point[],
-  //   clearance: number,
-  // ): Point[][] {
-  //   const polygons: Point[][] = []
-  //   const side = clearance * 2
-  //
-  //   for (let i = 0; i < path.length - 1; i++) {
-  //     const a = path[i]!
-  //     const b = path[i + 1]!
-  //     const dx = b.x - a.x
-  //     const dy = b.y - a.y
-  //     const segLen = Math.hypot(dx, dy)
-  //
-  //     if (segLen < 1e-9) continue
-  //
-  //     const steps = Math.max(1, Math.ceil(segLen / side))
-  //     for (let s = 0; s <= steps; s++) {
-  //       const t = s / steps
-  //       const cx = a.x + dx * t
-  //       const cy = a.y + dy * t
-  //       polygons.push(rectToPolygon(cx, cy, side, side, 0))
-  //     }
-  //   }
-  //
-  //   return polygons
-  // }
 
   /**
    * Convert a polyline path into a single thick polygon obstacle by offsetting
@@ -568,6 +554,33 @@ export class GreedySequentialPathSolver extends BaseSolver {
     return rectToPolygon(viaPoint.x, viaPoint.y, r * 2, r * 2, this.margin)
   }
 
+  /** Search using Polyanya SearchInstance (mesh-based, no weighted regions) */
+  private searchPolyanya(
+    mesh: Mesh,
+    start: Point,
+    end: Point,
+  ): { cost: number; path: Point[] } {
+    const si = new SearchInstance(mesh)
+    si.setStartGoal(start, end)
+    const found = si.search()
+    if (!found) return { cost: -1, path: [] }
+    return { cost: si.getCost(), path: si.getPathPoints() }
+  }
+
+  /** Search using VisibilityGraph (supports weighted regions) */
+  private searchVG(
+    mesh: Mesh,
+    layerZ: number,
+    start: Point,
+    end: Point,
+  ): { cost: number; path: Point[] } {
+    const vg = new VisibilityGraph(mesh, {
+      weightedRegions: this.useObstacles ? [] : this.traceWeightedRegions[layerZ]!,
+    })
+    const r = vg.search(start, end)
+    return { cost: r.cost, path: r.path }
+  }
+
   /**
    * Pick the best connection to route on a specific layer.
    * Returns index into remaining, or -1 if nothing is routable.
@@ -579,13 +592,13 @@ export class GreedySequentialPathSolver extends BaseSolver {
     const mesh = this.meshes[layerZ]
     if (!mesh) return { idx: -1, path: [] }
 
-    const vg = new VisibilityGraph(mesh, {
-      weightedRegions: this.useObstacles ? [] : this.traceWeightedRegions[layerZ]!,
-    })
-
     let bestIdx = -1
     let bestCost = pickShortest ? Infinity : -Infinity
     let bestPath: Point[] = []
+
+    // Track which start/end combo was best for the winning connection
+    let bestStart: Point | null = null
+    let bestEnd: Point | null = null
 
     for (let i = 0; i < this.remaining.length; i++) {
       const c = this.remaining[i]!
@@ -597,7 +610,9 @@ export class GreedySequentialPathSolver extends BaseSolver {
       let foundForThis = false
       for (const s of starts) {
         for (const e of ends) {
-          const r = vg.search(s, e)
+          const r = this.usePolyanya
+            ? this.searchPolyanya(mesh, s, e)
+            : this.searchVG(mesh, layerZ, s, e)
           if (r.cost < 0 || r.path.length === 0) continue
 
           const better = pickShortest
@@ -607,15 +622,20 @@ export class GreedySequentialPathSolver extends BaseSolver {
             bestIdx = i
             bestCost = r.cost
             bestPath = r.path
-            // Update the connection's active start/end to the one that worked
-            c.start = s
-            c.end = e
+            bestStart = s
+            bestEnd = e
           }
           foundForThis = true
-          break // found a route for this start, no need to try more ends
+          break
         }
         if (foundForThis) break
       }
+    }
+
+    // Update the winning connection's active start/end
+    if (bestIdx >= 0 && bestStart && bestEnd) {
+      this.remaining[bestIdx]!.start = bestStart
+      this.remaining[bestIdx]!.end = bestEnd
     }
 
     return { idx: bestIdx, path: bestPath }
@@ -765,6 +785,51 @@ export class GreedySequentialPathSolver extends BaseSolver {
     }
   }
 
+  /** Save current results if they're the best so far */
+  private saveIfBest() {
+    if (
+      !this.bestResults ||
+      this.resolvedPaths.length > this.bestResults.length
+    ) {
+      this.bestResults = this.resolvedPaths
+      this.bestObstaclePolys = this.traceObstaclePolys
+    }
+  }
+
+  /** Add a new layer (base obstacle polygons already computed in constructor) */
+  private addLayer() {
+    this.layerCount++
+  }
+
+  /** Advance to the next phase after current phase gets stuck */
+  private advancePhase() {
+    this.saveIfBest()
+
+    if (this.phase === "shortest") {
+      this.resetState()
+      this.phase = "longest"
+      return
+    }
+
+    if (this.phase === "longest") {
+      // Try adding a layer if allowed
+      if (this.layerCount < this.maxLayerCount) {
+        this.addLayer()
+        this.resetState()
+        this.phase = "shortest"
+        return
+      }
+    }
+
+    // All phases and layers exhausted — use best result
+    if (this.bestResults) {
+      this.resolvedPaths = this.bestResults
+      this.traceObstaclePolys = this.bestObstaclePolys!
+    }
+    this.phase = "done"
+    this.solved = true
+  }
+
   _step() {
     if (this.phase === "done") {
       this.solved = true
@@ -777,12 +842,18 @@ export class GreedySequentialPathSolver extends BaseSolver {
     // Timeout guard: bail if solving takes too long
     if (Date.now() - this.solveStartTime > GreedySequentialPathSolver.MAX_SOLVE_TIME_MS) {
       console.warn(`GreedySequentialPathSolver: timeout after ${GreedySequentialPathSolver.MAX_SOLVE_TIME_MS}ms, ${this.resolvedPaths.length}/${this.totalConnections} routed`)
+      this.saveIfBest()
+      if (this.bestResults) {
+        this.resolvedPaths = this.bestResults
+        this.traceObstaclePolys = this.bestObstaclePolys!
+      }
       this.phase = "done"
       this.solved = true
       return
     }
 
     if (this.remaining.length === 0) {
+      this.saveIfBest()
       this.phase = "done"
       this.solved = true
       return
@@ -792,23 +863,8 @@ export class GreedySequentialPathSolver extends BaseSolver {
     const { idx, path, layerZ } = this.pickBestAcrossLayers(pickShortest)
 
     if (idx < 0) {
-      // Stuck — no connection routable on any layer
-      if (this.phase === "shortest") {
-        this.shortestResults = this.resolvedPaths
-        this.shortestObstaclePolys = this.traceObstaclePolys
-        this.resetState()
-        this.phase = "longest"
-      } else {
-        if (
-          this.shortestResults &&
-          this.shortestResults.length > this.resolvedPaths.length
-        ) {
-          this.resolvedPaths = this.shortestResults
-          this.traceObstaclePolys = this.shortestObstaclePolys!
-        }
-        this.phase = "done"
-        this.solved = true
-      }
+      // Stuck — advance to next phase
+      this.advancePhase()
       return
     }
 
@@ -822,6 +878,11 @@ export class GreedySequentialPathSolver extends BaseSolver {
 
   getResolvedPaths(): ResolvedPath[] {
     return this.resolvedPaths
+  }
+
+  /** Connection names that couldn't be routed */
+  getUnroutedConnectionNames(): string[] {
+    return this.remaining.map((c) => c.name)
   }
 
   getEffectiveLayerCount(): number {
