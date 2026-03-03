@@ -3,8 +3,8 @@
 const datasetName = process.argv[2]
 
 if (!datasetName) {
-  console.error("Usage: bun scripts/run-benchmark.ts <dataset-name>")
-  console.error("Example: bun scripts/run-benchmark.ts dataset01")
+  console.error("Usage: bun scripts/benchmark/run-benchmark.ts <dataset-name>")
+  console.error("Example: bun scripts/benchmark/run-benchmark.ts dataset01")
   process.exit(1)
 }
 

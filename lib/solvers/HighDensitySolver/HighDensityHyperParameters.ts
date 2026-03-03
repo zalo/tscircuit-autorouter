@@ -54,4 +54,6 @@ export interface HighDensityHyperParameters {
 
   // Whether to use the greedy descent with crossing vias solver
   GREEDY_DESCENT_CROSSING_VIAS?: boolean
+
+  FIXED_TOPOLOGY_HIGH_DENSITY_INTRA_NODE_SOLVER?: boolean
 }

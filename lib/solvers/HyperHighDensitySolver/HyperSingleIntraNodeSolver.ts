@@ -15,6 +15,8 @@ import { SingleTransitionIntraNodeSolver } from "../HighDensitySolver/SingleTran
 import { MultiHeadPolyLineIntraNodeSolver2 } from "../HighDensitySolver/MultiHeadPolyLineIntraNodeSolver/MultiHeadPolyLineIntraNodeSolver2_Optimized"
 import { MultiHeadPolyLineIntraNodeSolver3 } from "../HighDensitySolver/MultiHeadPolyLineIntraNodeSolver/MultiHeadPolyLineIntraNodeSolver3_ViaPossibilitiesSolverIntegration"
 import { GreedyDescentCrossingViasSolver } from "../HighDensitySolver/GreedyDescentCrossingViasSolver"
+import { HighDensitySolverA01 } from "@tscircuit/high-density-a01"
+import { FixedTopologyHighDensityIntraNodeSolver } from "../FixedTopologyHighDensityIntraNodeSolver"
 
 export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
   | IntraNodeRouteSolver
@@ -22,6 +24,7 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
   | SingleTransitionCrossingRouteSolver
   | SingleTransitionIntraNodeSolver
   | GreedyDescentCrossingViasSolver
+  | FixedTopologyHighDensityIntraNodeSolver
 > {
   override getSolverName(): string {
     return "HyperSingleIntraNodeSolver"
@@ -39,7 +42,7 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
     this.nodeWithPortPoints = opts.nodeWithPortPoints
     this.connMap = opts.connMap
     this.constructorParams = opts
-    this.MAX_ITERATIONS = 250_000
+    this.MAX_ITERATIONS = 30_000_000
     this.GREEDY_MULTIPLIER = 5
     this.MIN_SUBSTEPS = 100
   }
@@ -53,7 +56,9 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
       ["orderings50"],
       ["flipTraceAlignmentDirection", "orderings6"],
       ["closedFormSingleTrace"],
-      ["closedFormTwoTrace"],
+      // ["closedFormTwoTrace"],
+      ["highDensityA01"],
+      ["fixedTopologyHighDensityIntraNodeSolver"],
     ]
   }
 
@@ -140,17 +145,17 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
           SHUFFLE_SEED: 100 + i,
         })),
       },
-      {
-        name: "closedFormTwoTrace",
-        possibleValues: [
-          {
-            CLOSED_FORM_TWO_TRACE_SAME_LAYER: true,
-          },
-          {
-            CLOSED_FORM_TWO_TRACE_TRANSITION_CROSSING: true,
-          },
-        ],
-      },
+      // {
+      //   name: "closedFormTwoTrace",
+      //   possibleValues: [
+      //     {
+      //       CLOSED_FORM_TWO_TRACE_SAME_LAYER: true,
+      //     },
+      //     {
+      //       CLOSED_FORM_TWO_TRACE_TRANSITION_CROSSING: true,
+      //     },
+      //   ],
+      // },
       {
         name: "closedFormSingleTrace",
         possibleValues: [
@@ -184,10 +189,29 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
           },
         ],
       },
+      {
+        name: "highDensityA01",
+        possibleValues: [
+          {
+            HIGH_DENSITY_A01: true,
+          },
+        ],
+      },
+      {
+        name: "fixedTopologyHighDensityIntraNodeSolver",
+        possibleValues: [
+          {
+            FIXED_TOPOLOGY_HIGH_DENSITY_INTRA_NODE_SOLVER: true,
+          },
+        ],
+      },
     ]
   }
 
   computeG(solver: IntraNodeRouteSolver) {
+    if ((solver as any) instanceof HighDensitySolverA01) {
+      return (solver as any).iterations / 1_000_000
+    }
     if (solver?.hyperParameters?.MULTI_HEAD_POLYLINE_SOLVER) {
       return (
         1000 +
@@ -211,6 +235,21 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
         nodeWithPortPoints: this.nodeWithPortPoints,
         viaDiameter: this.constructorParams.viaDiameter,
       }) as any
+    }
+    if (hyperParameters.HIGH_DENSITY_A01) {
+      const solver = new HighDensitySolverA01({
+        nodeWithPortPoints: this.nodeWithPortPoints,
+        cellSizeMm: 0.1,
+        viaDiameter: this.constructorParams.viaDiameter ?? 0.3,
+        viaMinDistFromBorder: 0.15,
+        traceMargin: 0.15,
+        traceThickness: this.constructorParams.traceWidth ?? 0.15,
+        hyperParameters: {
+          shuffleSeed: hyperParameters.SHUFFLE_SEED ?? 0,
+        },
+      })
+      solver.MAX_ITERATIONS = 10_000_000
+      return solver as any
     }
     if (hyperParameters.CLOSED_FORM_TWO_TRACE_SAME_LAYER) {
       return new TwoCrossingRoutesHighDensitySolver({
@@ -238,6 +277,15 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
         viaDiameter: this.constructorParams.viaDiameter,
       }) as any
     }
+    if (hyperParameters.FIXED_TOPOLOGY_HIGH_DENSITY_INTRA_NODE_SOLVER) {
+      return new FixedTopologyHighDensityIntraNodeSolver({
+        nodeWithPortPoints: this.nodeWithPortPoints,
+        connMap: this.connMap,
+        colorMap: this.constructorParams.colorMap,
+        viaDiameter: this.constructorParams.viaDiameter,
+        traceWidth: this.constructorParams.traceWidth,
+      }) as any
+    }
     return new CachedIntraNodeRouteSolver({
       ...this.constructorParams,
       hyperParameters,
@@ -245,7 +293,13 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
   }
 
   onSolve(solver: SupervisedSolver<IntraNodeRouteSolver>) {
-    this.solvedRoutes = solver.solver.solvedRoutes.map((route) => {
+    let routes: HighDensityIntraNodeRoute[]
+    if ((solver.solver as any) instanceof HighDensitySolverA01) {
+      routes = (solver.solver as any).getOutput()
+    } else {
+      routes = solver.solver.solvedRoutes
+    }
+    this.solvedRoutes = routes.map((route) => {
       const matchingPortPoint = this.nodeWithPortPoints.portPoints.find(
         (p) => p.connectionName === route.connectionName,
       )

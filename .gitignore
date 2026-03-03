@@ -188,3 +188,4 @@ yalc.lock
 # Generated test plans
 .bun-test-plan/
 hypergraph
+benchmark-result.txt

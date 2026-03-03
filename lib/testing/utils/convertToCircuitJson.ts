@@ -397,6 +397,7 @@ function extractViasFromRoutes(
       // Extract vias from HighDensityRoutes by looking for layer changes
       ;(routes as HighDensityRoute[]).forEach((route, routeIndex) => {
         const traceId = `trace_${routeIndex}`
+        const viaDiameter = route.viaDiameter || minViaDiameter
         for (let i = 1; i < route.route.length; i++) {
           const prevPoint = route.route[i - 1]
           const currPoint = route.route[i]
@@ -418,8 +419,8 @@ function extractViasFromRoutes(
                 pcb_trace_id: traceId,
                 x: currPoint.x,
                 y: currPoint.y,
-                outer_diameter: minViaDiameter,
-                hole_diameter: minViaDiameter * 0.5,
+                outer_diameter: viaDiameter,
+                hole_diameter: viaDiameter * 0.5,
                 layers: [fromLayer, toLayer] as LayerName[],
               })
               viaLocations.add(locationKey)

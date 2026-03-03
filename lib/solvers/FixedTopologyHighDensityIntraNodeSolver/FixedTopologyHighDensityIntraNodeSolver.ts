@@ -2,14 +2,16 @@ import {
   type XYConnection as HgXYConnection,
   type JPort,
   type JRegion,
+  type ViaData,
   type ViaByNet,
+  type ViaTile,
   ViaGraphSolver,
-  createViaGraphWithConnections,
-  generateDefaultViaTopologyGrid,
+  createConvexViaGraphFromXYConnections,
+  viaTile as defaultViaTile,
 } from "@tscircuit/hypergraph"
 import { ConnectivityMap } from "circuit-json-to-connectivity-map"
-import { getBoundsFromNodeWithPortPoints } from "lib/utils/getBoundsFromNodeWithPortPoints"
 import type {
+  HighDensityIntraNodeRoute,
   NodeWithPortPoints,
   PortPoint,
 } from "../../types/high-density-types"
@@ -23,11 +25,7 @@ export type ViaRegion = {
   connectedTo: string[]
 }
 
-export type HighDensityIntraNodeRouteWithVias = {
-  connectionName: string
-  rootConnectionName?: string
-  traceThickness: number
-  route: Array<{ x: number; y: number; z: number }>
+export type HighDensityIntraNodeRouteWithVias = HighDensityIntraNodeRoute & {
   viaRegions: ViaRegion[]
 }
 
@@ -35,6 +33,7 @@ export interface FixedTopologyHighDensityIntraNodeSolverParams {
   nodeWithPortPoints: NodeWithPortPoints
   colorMap?: Record<string, string>
   traceWidth?: number
+  viaDiameter?: number
   connMap?: ConnectivityMap
 }
 
@@ -51,6 +50,8 @@ export class FixedTopologyHighDensityIntraNodeSolver extends BaseSolver {
   nodeWithPortPoints: NodeWithPortPoints
   colorMap: Record<string, string>
   traceWidth: number
+  viaDiameter: number
+  viaTile: ViaTile
   connMap?: ConnectivityMap
 
   rootConnectionNameByConnectionId: Map<string, string | undefined> = new Map()
@@ -66,6 +67,8 @@ export class FixedTopologyHighDensityIntraNodeSolver extends BaseSolver {
     this.nodeWithPortPoints = params.nodeWithPortPoints
     this.colorMap = params.colorMap ?? {}
     this.traceWidth = params.traceWidth ?? 0.15
+    this.viaTile = defaultViaTile
+    this.viaDiameter = this._resolveViaDiameter(params.viaDiameter)
     this.connMap = params.connMap
     this.MAX_ITERATIONS = 1e6
 
@@ -79,16 +82,31 @@ export class FixedTopologyHighDensityIntraNodeSolver extends BaseSolver {
     return this.constructorParams
   }
 
-  private _initializeGraph(): ViaGraphSolver | null {
-    const node = this.nodeWithPortPoints
-    const nodeBounds = getBoundsFromNodeWithPortPoints(node)
+  private _getViaTileDiameter(viaTile: ViaTile): number {
+    for (const vias of Object.values(viaTile.viasByNet)) {
+      if (vias.length > 0) return vias[0].diameter
+    }
+    return 0.3
+  }
 
+  private _resolveViaDiameter(requestedViaDiameter?: number): number {
+    const viaTileDiameter = this._getViaTileDiameter(this.viaTile)
+    if (
+      requestedViaDiameter !== undefined &&
+      Math.abs(requestedViaDiameter - viaTileDiameter) <= 1e-6
+    ) {
+      return requestedViaDiameter
+    }
+    return viaTileDiameter
+  }
+
+  private _initializeGraph(): ViaGraphSolver | null {
     // Build connections from port points
     const connectionMap = new Map<
       string,
       { points: PortPoint[]; rootConnectionName?: string }
     >()
-    for (const pp of node.portPoints) {
+    for (const pp of this.nodeWithPortPoints.portPoints) {
       const existing = connectionMap.get(pp.connectionName)
       if (existing) {
         existing.points.push(pp)
@@ -119,25 +137,19 @@ export class FixedTopologyHighDensityIntraNodeSolver extends BaseSolver {
     }
     if (inputConnections.length === 0) return null
 
-    const viaTopology = generateDefaultViaTopologyGrid({
-      bounds: nodeBounds,
-    })
-    const result = createViaGraphWithConnections(
-      {
-        regions: viaTopology.regions,
-        ports: viaTopology.ports,
-      },
+    const convexGraph = createConvexViaGraphFromXYConnections(
       inputConnections,
+      this.viaTile,
     )
-    this.tiledViasByNet = viaTopology.viaTile.viasByNet ?? {}
+    this.tiledViasByNet = convexGraph.viaTile.viasByNet ?? {}
 
     return new ViaGraphSolver({
       inputGraph: {
-        regions: result.regions,
-        ports: result.ports,
+        regions: convexGraph.regions,
+        ports: convexGraph.ports,
       },
-      inputConnections: result.connections,
-      viaTile: viaTopology.viaTile,
+      inputConnections: convexGraph.connections,
+      viaTile: convexGraph.viaTile,
     })
   }
 
@@ -166,55 +178,6 @@ export class FixedTopologyHighDensityIntraNodeSolver extends BaseSolver {
       this.activeSubSolver = null
       this.failed = true
     }
-  }
-
-  private _getAllViaPositions(): Array<{
-    position: { x: number; y: number }
-    diameter: number
-  }> {
-    const allViaPositions: Array<{
-      position: { x: number; y: number }
-      diameter: number
-    }> = []
-
-    for (const vias of Object.values(this.tiledViasByNet ?? {})) {
-      for (const via of vias) {
-        allViaPositions.push({
-          position: via.position,
-          diameter: via.diameter,
-        })
-      }
-    }
-
-    return allViaPositions
-  }
-
-  private _findClosestVia(
-    port: JPort,
-    allViaPositions: ReturnType<typeof this._getAllViaPositions>,
-  ): { position: { x: number; y: number }; diameter: number } | null {
-    let closest: {
-      position: { x: number; y: number }
-      diameter: number
-    } | null = null
-    let minDistSquared = Infinity
-
-    for (const via of allViaPositions) {
-      const dx = via.position.x - port.d.x
-      const dy = via.position.y - port.d.y
-      const distSquared = dx * dx + dy * dy
-      if (distSquared < minDistSquared) {
-        minDistSquared = distSquared
-        closest = via
-      }
-    }
-
-    // max distance 1mm
-    if (closest && minDistSquared < 1) {
-      return closest
-    }
-
-    return null
   }
 
   private _upsertGlobalVia(
@@ -266,7 +229,160 @@ export class FixedTopologyHighDensityIntraNodeSolver extends BaseSolver {
     })
   }
 
-  private _recordViaTransition(
+  private _appendRoutePoint(
+    routePoints: Array<{ x: number; y: number; z: number }>,
+    point: { x: number; y: number; z: number },
+  ) {
+    const lastPoint = routePoints[routePoints.length - 1]
+    if (
+      lastPoint &&
+      Math.abs(lastPoint.x - point.x) <= 1e-6 &&
+      Math.abs(lastPoint.y - point.y) <= 1e-6 &&
+      lastPoint.z === point.z
+    ) {
+      return
+    }
+    routePoints.push(point)
+  }
+
+  private _parseViaRegionNetName(regionId: string): string | null {
+    const marker = ":v:"
+    const markerIndex = regionId.lastIndexOf(marker)
+    if (markerIndex !== -1) return regionId.slice(markerIndex + marker.length)
+    const lastColon = regionId.lastIndexOf(":")
+    if (lastColon === -1) return regionId
+    return regionId.slice(lastColon + 1)
+  }
+
+  private _parseViaRegionTilePrefix(regionId: string): string | null {
+    const marker = ":v:"
+    const markerIndex = regionId.lastIndexOf(marker)
+    if (markerIndex <= 0) return null
+    return regionId.slice(0, markerIndex)
+  }
+
+  private _selectViasForTraversedRegion(
+    viaTile: ViaTile,
+    viaRegion: JRegion,
+  ): ViaData[] {
+    const netName = this._parseViaRegionNetName(viaRegion.regionId)
+    if (!netName) return []
+    const viasForNet = viaTile.viasByNet[netName]
+    if (!viasForNet || viasForNet.length === 0) return []
+
+    const tilePrefix = this._parseViaRegionTilePrefix(viaRegion.regionId)
+    if (!tilePrefix) return viasForNet
+
+    const tileScopedVias = viasForNet.filter((via) =>
+      via.viaId.startsWith(`${tilePrefix}:`),
+    )
+    return tileScopedVias.length > 0 ? tileScopedVias : viasForNet
+  }
+
+  private _findNearestVia(vias: ViaData[], point: { x: number; y: number }) {
+    let best: ViaData | null = null
+    let bestDistance = Infinity
+    for (const via of vias) {
+      const dx = via.position.x - point.x
+      const dy = via.position.y - point.y
+      const distance = dx * dx + dy * dy
+      if (distance < bestDistance) {
+        bestDistance = distance
+        best = via
+      }
+    }
+    return best
+  }
+
+  private _getBottomRoutePointsBetweenVias(
+    viaTile: ViaTile,
+    viasForRegion: ViaData[],
+    entryVia: ViaData,
+    exitVia: ViaData,
+  ): Array<{ x: number; y: number }> | null {
+    if (entryVia.viaId === exitVia.viaId) {
+      return [entryVia.position]
+    }
+
+    const viaIdSet = new Set(viasForRegion.map((via) => via.viaId))
+    const bottomSegments = viaTile.routeSegments.filter(
+      (routeSegment) =>
+        routeSegment.layer === "bottom" &&
+        routeSegment.segments.length >= 2 &&
+        viaIdSet.has(routeSegment.fromPort) &&
+        viaIdSet.has(routeSegment.toPort),
+    )
+
+    const adjacency = new Map<
+      string,
+      Array<{ to: string; points: Array<{ x: number; y: number }> }>
+    >()
+    const addEdge = (
+      from: string,
+      to: string,
+      points: Array<{ x: number; y: number }>,
+    ) => {
+      if (!adjacency.has(from)) adjacency.set(from, [])
+      adjacency.get(from)!.push({ to, points })
+    }
+
+    for (const routeSegment of bottomSegments) {
+      addEdge(routeSegment.fromPort, routeSegment.toPort, routeSegment.segments)
+      addEdge(
+        routeSegment.toPort,
+        routeSegment.fromPort,
+        [...routeSegment.segments].reverse(),
+      )
+    }
+
+    const queue = [entryVia.viaId]
+    const visited = new Set<string>([entryVia.viaId])
+    const prev = new Map<
+      string,
+      { from: string; points: Array<{ x: number; y: number }> }
+    >()
+
+    while (queue.length > 0) {
+      const viaId = queue.shift()!
+      if (viaId === exitVia.viaId) break
+      for (const edge of adjacency.get(viaId) ?? []) {
+        if (visited.has(edge.to)) continue
+        visited.add(edge.to)
+        prev.set(edge.to, { from: viaId, points: edge.points })
+        queue.push(edge.to)
+      }
+    }
+
+    if (!prev.has(exitVia.viaId)) return null
+
+    const edgeChain: Array<Array<{ x: number; y: number }>> = []
+    let cursor = exitVia.viaId
+    while (cursor !== entryVia.viaId) {
+      const step = prev.get(cursor)
+      if (!step) return null
+      edgeChain.push(step.points)
+      cursor = step.from
+    }
+    edgeChain.reverse()
+
+    const pathPoints: Array<{ x: number; y: number }> = []
+    for (const points of edgeChain) {
+      for (const point of points) {
+        const lastPoint = pathPoints[pathPoints.length - 1]
+        if (
+          !lastPoint ||
+          Math.abs(lastPoint.x - point.x) > 1e-6 ||
+          Math.abs(lastPoint.y - point.y) > 1e-6
+        ) {
+          pathPoints.push(point)
+        }
+      }
+    }
+
+    return pathPoints.length > 0 ? pathPoints : null
+  }
+
+  private _appendViaUsage(
     viasByPosition: Map<
       string,
       {
@@ -278,23 +394,19 @@ export class FixedTopologyHighDensityIntraNodeSolver extends BaseSolver {
     routeViaRegions: ViaRegion[],
     connectionName: string,
     regionId: string,
-    port: JPort | null,
-    allViaPositions: ReturnType<typeof this._getAllViaPositions>,
+    via: ViaData | null,
   ) {
-    if (!port) return
-    const viaInfo = this._findClosestVia(port, allViaPositions)
-    if (!viaInfo) return
-
+    if (!via) return
     this._upsertGlobalVia(
       viasByPosition,
-      viaInfo.position,
-      viaInfo.diameter,
+      via.position,
+      via.diameter,
       connectionName,
     )
     this._upsertRouteViaRegion(
       routeViaRegions,
-      viaInfo.position,
-      viaInfo.diameter,
+      via.position,
+      via.diameter,
       connectionName,
       regionId,
     )
@@ -302,7 +414,7 @@ export class FixedTopologyHighDensityIntraNodeSolver extends BaseSolver {
 
   private _processResults(viaGraphSolver: ViaGraphSolver) {
     this.solvedRoutes = []
-    const allViaPositions = this._getAllViaPositions()
+    const viaTile = viaGraphSolver.viaTile
     const viasByPosition: Map<
       string,
       {
@@ -319,84 +431,146 @@ export class FixedTopologyHighDensityIntraNodeSolver extends BaseSolver {
 
       const routePoints: Array<{ x: number; y: number; z: number }> = []
       const routeViaRegions: ViaRegion[] = []
-      let currentViaRegionId: string | null = null
-      let currentViaEntryPort: JPort | null = null
+      const path = solvedRoute.path
 
-      for (let i = 0; i < solvedRoute.path.length; i++) {
-        const candidate = solvedRoute.path[i]
-        const port = candidate.port as JPort
-        const lastRegion = candidate.lastRegion as JRegion | undefined
+      if (path.length === 0) continue
 
-        // Add the port position as a route point
-        routePoints.push({
-          x: port.d.x,
-          y: port.d.y,
-          z: 0,
-        })
+      const firstPort = path[0].port as JPort
+      this._appendRoutePoint(routePoints, {
+        x: firstPort.d.x,
+        y: firstPort.d.y,
+        z: 0,
+      })
 
-        if (!lastRegion?.d?.isViaRegion) {
-          if (currentViaRegionId && currentViaEntryPort) {
-            this._recordViaTransition(
-              viasByPosition,
-              routeViaRegions,
-              connectionName,
-              currentViaRegionId,
-              candidate.lastPort as JPort | null,
-              allViaPositions,
-            )
-            currentViaRegionId = null
-            currentViaEntryPort = null
-          }
+      for (let i = 1; i < path.length; i++) {
+        const previousCandidate = path[i - 1]
+        const currentCandidate = path[i]
+        const previousPoint = {
+          x: previousCandidate.port.d.x,
+          y: previousCandidate.port.d.y,
+        }
+        const currentPoint = {
+          x: currentCandidate.port.d.x,
+          y: currentCandidate.port.d.y,
+        }
+        const traversedRegion = currentCandidate.lastRegion as
+          | JRegion
+          | undefined
+
+        if (!traversedRegion?.d?.isViaRegion || !viaTile) {
+          this._appendRoutePoint(routePoints, {
+            x: currentPoint.x,
+            y: currentPoint.y,
+            z: 0,
+          })
           continue
         }
 
-        const nextViaRegionId = lastRegion.regionId
-        if (nextViaRegionId === currentViaRegionId) {
+        const viasForRegion = this._selectViasForTraversedRegion(
+          viaTile,
+          traversedRegion,
+        )
+        if (viasForRegion.length === 0) {
+          this._appendRoutePoint(routePoints, {
+            x: currentPoint.x,
+            y: currentPoint.y,
+            z: 0,
+          })
           continue
         }
 
-        if (currentViaRegionId && currentViaEntryPort) {
-          this._recordViaTransition(
-            viasByPosition,
-            routeViaRegions,
-            connectionName,
-            currentViaRegionId,
-            candidate.lastPort as JPort | null,
-            allViaPositions,
-          )
+        const entryVia = this._findNearestVia(viasForRegion, previousPoint)
+        const exitVia = this._findNearestVia(viasForRegion, currentPoint)
+
+        if (!entryVia || !exitVia) {
+          this._appendRoutePoint(routePoints, {
+            x: currentPoint.x,
+            y: currentPoint.y,
+            z: 0,
+          })
+          continue
         }
 
-        currentViaRegionId = nextViaRegionId
-        currentViaEntryPort = candidate.lastPort as JPort | null
-        this._recordViaTransition(
+        const bottomPoints = this._getBottomRoutePointsBetweenVias(
+          viaTile,
+          viasForRegion,
+          entryVia,
+          exitVia,
+        )
+        if (!bottomPoints || bottomPoints.length === 0) {
+          this._appendRoutePoint(routePoints, {
+            x: currentPoint.x,
+            y: currentPoint.y,
+            z: 0,
+          })
+          continue
+        }
+
+        this._appendViaUsage(
           viasByPosition,
           routeViaRegions,
           connectionName,
-          nextViaRegionId,
-          currentViaEntryPort,
-          allViaPositions,
+          traversedRegion.regionId,
+          entryVia,
         )
+        this._appendViaUsage(
+          viasByPosition,
+          routeViaRegions,
+          connectionName,
+          traversedRegion.regionId,
+          exitVia,
+        )
+
+        this._appendRoutePoint(routePoints, {
+          x: entryVia.position.x,
+          y: entryVia.position.y,
+          z: 0,
+        })
+        this._appendRoutePoint(routePoints, {
+          x: entryVia.position.x,
+          y: entryVia.position.y,
+          z: 1,
+        })
+
+        for (const point of bottomPoints) {
+          this._appendRoutePoint(routePoints, { x: point.x, y: point.y, z: 1 })
+        }
+
+        this._appendRoutePoint(routePoints, {
+          x: exitVia.position.x,
+          y: exitVia.position.y,
+          z: 1,
+        })
+        this._appendRoutePoint(routePoints, {
+          x: exitVia.position.x,
+          y: exitVia.position.y,
+          z: 0,
+        })
+
+        this._appendRoutePoint(routePoints, {
+          x: currentPoint.x,
+          y: currentPoint.y,
+          z: 0,
+        })
       }
 
-      if (currentViaRegionId && currentViaEntryPort) {
-        const lastCandidate = solvedRoute.path[solvedRoute.path.length - 1]
-        if (lastCandidate) {
-          this._recordViaTransition(
-            viasByPosition,
-            routeViaRegions,
-            connectionName,
-            currentViaRegionId,
-            lastCandidate.port as JPort,
-            allViaPositions,
-          )
-        }
-      }
+      const routeVias = routeViaRegions.map((viaRegion) => ({
+        x: viaRegion.center.x,
+        y: viaRegion.center.y,
+      }))
 
       this.solvedRoutes.push({
         connectionName,
         rootConnectionName,
         traceThickness: this.traceWidth,
+        viaDiameter:
+          routeViaRegions.length > 0
+            ? Math.max(
+                ...routeViaRegions.map((viaRegion) => viaRegion.diameter),
+              )
+            : this.viaDiameter,
         route: routePoints,
+        vias: routeVias,
         viaRegions: routeViaRegions,
       })
     }
