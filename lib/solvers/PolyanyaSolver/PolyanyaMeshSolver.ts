@@ -40,13 +40,13 @@ export class PolyanyaMeshSolver extends BaseSolver {
     this.obstaclePolygons = mergeOverlappingRects(expandedPolygons)
 
     // Triangulate free space around obstacles
-    const regions = cdtTriangulate({
+    const cdtResult = cdtTriangulate({
       bounds: this.srj.bounds,
       obstacles: this.obstaclePolygons,
     })
 
     // Build navmesh from triangle regions
-    const rawMesh = buildMeshFromRegions({ regions })
+    const rawMesh = buildMeshFromRegions(cdtResult)
 
     // Merge into larger convex polygons for faster search
     this.mesh = mergeMesh(rawMesh)

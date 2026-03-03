@@ -1,5 +1,5 @@
 import { AutoroutingPipelineDebugger } from "lib/testing/AutoroutingPipelineDebugger"
-import { CrossingRepulsionPipelineSolver } from "lib/autorouter-pipelines/CrossingRepulsionPipeline/CrossingRepulsionPipelineSolver"
+import { GreedySequentialPipelineSolver } from "lib/autorouter-pipelines/GreedySequentialPipeline/GreedySequentialPipelineSolver"
 import type { SimpleRouteJson } from "lib/types"
 
 // 4 parallel traces entering a narrow corridor in mixed order
@@ -60,7 +60,7 @@ const simpleRouteJson: SimpleRouteJson = {
 
 export default () => (
   <AutoroutingPipelineDebugger
-    createSolver={(srj) => new CrossingRepulsionPipelineSolver(srj)}
+    createSolver={(srj) => new GreedySequentialPipelineSolver(srj)}
     srj={simpleRouteJson as any}
   />
 )

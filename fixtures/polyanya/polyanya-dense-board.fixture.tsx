@@ -1,5 +1,5 @@
 import { AutoroutingPipelineDebugger } from "lib/testing/AutoroutingPipelineDebugger"
-import { CrossingRepulsionPipelineSolver } from "lib/autorouter-pipelines/CrossingRepulsionPipeline/CrossingRepulsionPipelineSolver"
+import { GreedySequentialPipelineSolver } from "lib/autorouter-pipelines/GreedySequentialPipeline/GreedySequentialPipelineSolver"
 import type { SimpleRouteJson } from "lib/types"
 
 // Dense board with multiple components and 12 connections.
@@ -15,7 +15,7 @@ const simpleRouteJson: SimpleRouteJson = {
       center: { x: 0, y: 0 },
       width: 6,
       height: 6,
-      connectedTo: [],
+      connectedTo: ["data0", "data1", "data2", "data3", "gpio0", "gpio1", "vcc", "gnd", "pwr", "led0", "led1"],
     },
     // "Resistor array" — top right
     {
@@ -24,7 +24,7 @@ const simpleRouteJson: SimpleRouteJson = {
       center: { x: 8, y: 5 },
       width: 2,
       height: 1,
-      connectedTo: [],
+      connectedTo: ["gpio0"],
     },
     {
       type: "rect",
@@ -32,7 +32,7 @@ const simpleRouteJson: SimpleRouteJson = {
       center: { x: 8, y: 3 },
       width: 2,
       height: 1,
-      connectedTo: [],
+      connectedTo: ["gpio1"],
     },
     // "Caps" — bottom left decoupling
     {
@@ -41,7 +41,7 @@ const simpleRouteJson: SimpleRouteJson = {
       center: { x: -7, y: -4 },
       width: 1.5,
       height: 1,
-      connectedTo: [],
+      connectedTo: ["vcc"],
     },
     {
       type: "rect",
@@ -49,7 +49,7 @@ const simpleRouteJson: SimpleRouteJson = {
       center: { x: -7, y: -6 },
       width: 1.5,
       height: 1,
-      connectedTo: [],
+      connectedTo: ["gnd"],
     },
     // "Connector" — right edge
     {
@@ -58,7 +58,7 @@ const simpleRouteJson: SimpleRouteJson = {
       center: { x: 12, y: 0 },
       width: 2,
       height: 8,
-      connectedTo: [],
+      connectedTo: ["data0", "data1", "data2", "data3", "vbus"],
     },
     // "Voltage regulator" — top left
     {
@@ -67,7 +67,7 @@ const simpleRouteJson: SimpleRouteJson = {
       center: { x: -8, y: 5 },
       width: 3,
       height: 2,
-      connectedTo: [],
+      connectedTo: ["pwr", "vbus"],
     },
     // "LED cluster" — bottom right
     {
@@ -76,7 +76,7 @@ const simpleRouteJson: SimpleRouteJson = {
       center: { x: 7, y: -5 },
       width: 1,
       height: 1,
-      connectedTo: [],
+      connectedTo: ["led0"],
     },
     {
       type: "rect",
@@ -84,7 +84,7 @@ const simpleRouteJson: SimpleRouteJson = {
       center: { x: 9, y: -5 },
       width: 1,
       height: 1,
-      connectedTo: [],
+      connectedTo: ["led1"],
     },
   ],
   connections: [
@@ -184,7 +184,7 @@ const simpleRouteJson: SimpleRouteJson = {
 
 export default () => (
   <AutoroutingPipelineDebugger
-    createSolver={(srj) => new CrossingRepulsionPipelineSolver(srj)}
+    createSolver={(srj) => new GreedySequentialPipelineSolver(srj)}
     srj={simpleRouteJson as any}
   />
 )

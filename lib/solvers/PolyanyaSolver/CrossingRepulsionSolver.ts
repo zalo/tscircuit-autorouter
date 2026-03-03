@@ -801,11 +801,11 @@ export class CrossingRepulsionSolver extends BaseSolver {
     }
 
     const mergedObstacles = mergeOverlappingRects(expandedObstacles)
-    const regions = cdtTriangulate({
+    const cdtResult = cdtTriangulate({
       bounds: this.srj.bounds,
       obstacles: mergedObstacles,
     })
-    const rawMesh = buildMeshFromRegions({ regions })
+    const rawMesh = buildMeshFromRegions(cdtResult)
     const viaMesh = mergeMesh(rawMesh)
     const finalSearch = new SearchInstance(viaMesh)
 

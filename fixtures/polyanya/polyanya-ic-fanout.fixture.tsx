@@ -1,18 +1,20 @@
 import { AutoroutingPipelineDebugger } from "lib/testing/AutoroutingPipelineDebugger"
-import { CrossingRepulsionPipelineSolver } from "lib/autorouter-pipelines/CrossingRepulsionPipeline/CrossingRepulsionPipelineSolver"
+import { GreedySequentialPipelineSolver } from "lib/autorouter-pipelines/GreedySequentialPipeline/GreedySequentialPipelineSolver"
 import type { SimpleRouteJson } from "lib/types"
 
 // Simulates an IC package fanout: central IC body with 8 pads
 // fanning out to 8 destinations around the perimeter.
 // Pad obstacles represent the IC body + pads that other traces must avoid.
 const padSize = 0.8
+const connNames = Array.from({ length: 8 }, (_, i) => `conn${i + 1}`)
+
 const icBody = {
   type: "rect" as const,
   layers: ["top", "bottom"],
   center: { x: 0, y: 0 },
   width: 4,
   height: 4,
-  connectedTo: [] as string[],
+  connectedTo: connNames,
 }
 
 // Generate pad obstacles along the IC edges
@@ -66,7 +68,7 @@ const simpleRouteJson: SimpleRouteJson = {
 
 export default () => (
   <AutoroutingPipelineDebugger
-    createSolver={(srj) => new CrossingRepulsionPipelineSolver(srj)}
+    createSolver={(srj) => new GreedySequentialPipelineSolver(srj)}
     srj={simpleRouteJson as any}
   />
 )

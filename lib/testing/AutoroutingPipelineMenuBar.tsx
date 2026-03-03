@@ -52,12 +52,12 @@ export const PIPELINE_OPTIONS = [
     label: "Assignable Pipeline 3 (Jumpers)",
   },
   {
-    id: "PolyanyaPipelineSolver",
-    label: "Polyanya Navmesh Pipeline",
-  },
-  {
     id: "CrossingRepulsionPipelineSolver",
     label: "Crossing Repulsion Pipeline",
+  },
+  {
+    id: "GreedySequentialPipelineSolver",
+    label: "Greedy Sequential Pipeline",
   },
 ] as const
 

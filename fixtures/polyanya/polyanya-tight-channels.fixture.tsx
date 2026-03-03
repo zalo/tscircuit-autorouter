@@ -1,5 +1,5 @@
 import { AutoroutingPipelineDebugger } from "lib/testing/AutoroutingPipelineDebugger"
-import { CrossingRepulsionPipelineSolver } from "lib/autorouter-pipelines/CrossingRepulsionPipeline/CrossingRepulsionPipelineSolver"
+import { GreedySequentialPipelineSolver } from "lib/autorouter-pipelines/GreedySequentialPipeline/GreedySequentialPipelineSolver"
 import type { SimpleRouteJson } from "lib/types"
 
 // Stress test: obstacles form tight channels that traces must
@@ -9,16 +9,16 @@ const simpleRouteJson: SimpleRouteJson = {
   minTraceWidth: 0.15,
   obstacles: [
     // Top wall with gap
-    { type: "rect", layers: ["top", "bottom"], center: { x: -4, y: 3 }, width: 6, height: 1.5, connectedTo: [] },
-    { type: "rect", layers: ["top", "bottom"], center: { x: 4, y: 3 }, width: 6, height: 1.5, connectedTo: [] },
+    { type: "rect", layers: ["top", "bottom"], center: { x: -4, y: 3.5 }, width: 6, height: 1, connectedTo: [] },
+    { type: "rect", layers: ["top", "bottom"], center: { x: 4, y: 3.5 }, width: 6, height: 1, connectedTo: [] },
     // Bottom wall with gap
-    { type: "rect", layers: ["top", "bottom"], center: { x: -4, y: -3 }, width: 6, height: 1.5, connectedTo: [] },
-    { type: "rect", layers: ["top", "bottom"], center: { x: 4, y: -3 }, width: 6, height: 1.5, connectedTo: [] },
+    { type: "rect", layers: ["top", "bottom"], center: { x: -4, y: -3.5 }, width: 6, height: 1, connectedTo: [] },
+    { type: "rect", layers: ["top", "bottom"], center: { x: 4, y: -3.5 }, width: 6, height: 1, connectedTo: [] },
     // Center pillar — forces traces around
-    { type: "rect", layers: ["top", "bottom"], center: { x: 0, y: 0 }, width: 1.5, height: 4, connectedTo: [] },
+    { type: "rect", layers: ["top", "bottom"], center: { x: 0, y: 0 }, width: 1.5, height: 2.5, connectedTo: [] },
     // Side obstacles narrowing the gaps further
-    { type: "rect", layers: ["top", "bottom"], center: { x: -8, y: 0 }, width: 1, height: 5, connectedTo: [] },
-    { type: "rect", layers: ["top", "bottom"], center: { x: 8, y: 0 }, width: 1, height: 5, connectedTo: [] },
+    { type: "rect", layers: ["top", "bottom"], center: { x: -8, y: 0 }, width: 1, height: 4, connectedTo: [] },
+    { type: "rect", layers: ["top", "bottom"], center: { x: 8, y: 0 }, width: 1, height: 4, connectedTo: [] },
   ],
   connections: [
     // 6 traces from left to right, must thread through gaps
@@ -34,7 +34,7 @@ const simpleRouteJson: SimpleRouteJson = {
 
 export default () => (
   <AutoroutingPipelineDebugger
-    createSolver={(srj) => new CrossingRepulsionPipelineSolver(srj)}
+    createSolver={(srj) => new GreedySequentialPipelineSolver(srj)}
     srj={simpleRouteJson as any}
   />
 )

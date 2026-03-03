@@ -3,6 +3,7 @@ import {
   InteractiveGraphics,
   InteractiveGraphicsCanvas,
 } from "graphics-debug/react"
+import { GraphicsCanvasWithPolygons } from "./GraphicsCanvasWithPolygons"
 import { BaseSolver } from "lib/solvers/BaseSolver"
 import { combineVisualizations } from "lib/utils/combineVisualizations"
 import { SimpleRouteJson } from "lib/types"
@@ -36,8 +37,8 @@ import {
 } from "./AutoroutingPipelineMenuBar"
 import { AssignableAutoroutingPipeline2 } from "lib/autorouter-pipelines/AssignableAutoroutingPipeline2/AssignableAutoroutingPipeline2"
 import { AssignableAutoroutingPipeline3 } from "lib/autorouter-pipelines/AssignableAutoroutingPipeline3/AssignableAutoroutingPipeline3"
-import { PolyanyaPipelineSolver } from "lib/autorouter-pipelines/PolyanyaPipeline/PolyanyaPipelineSolver"
 import { CrossingRepulsionPipelineSolver } from "lib/autorouter-pipelines/CrossingRepulsionPipeline/CrossingRepulsionPipelineSolver"
+import { GreedySequentialPipelineSolver } from "lib/autorouter-pipelines/GreedySequentialPipeline/GreedySequentialPipelineSolver"
 
 const PIPELINE_SOLVERS = {
   AutoroutingPipelineSolver2_PortPointPathing,
@@ -46,8 +47,8 @@ const PIPELINE_SOLVERS = {
   AssignableAutoroutingPipeline2,
   AssignableAutoroutingPipeline3,
   AutoroutingPipeline1_OriginalUnravel,
-  PolyanyaPipelineSolver,
   CrossingRepulsionPipelineSolver,
+  GreedySequentialPipelineSolver,
 } as const
 
 const PIPELINE_STORAGE_KEY = "selectedPipeline"
@@ -907,7 +908,7 @@ export const AutoroutingPipelineDebugger = ({
             objectLimit={20e3}
           />
         ) : (
-          <InteractiveGraphicsCanvas
+          <GraphicsCanvasWithPolygons
             graphics={visualization}
             showLabelsByDefault={false}
           />

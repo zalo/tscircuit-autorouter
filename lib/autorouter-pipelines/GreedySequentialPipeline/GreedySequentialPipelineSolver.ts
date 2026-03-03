@@ -2,7 +2,6 @@ import type { GraphicsObject, Line } from "graphics-debug"
 import { combineVisualizations } from "../../utils/combineVisualizations"
 import type {
   SimpleRouteJson,
-  SimplifiedPcbTrace,
   SimplifiedPcbTraces,
 } from "../../types"
 import { BaseSolver } from "../../solvers/BaseSolver"
@@ -11,29 +10,27 @@ import { ConnectivityMap } from "circuit-json-to-connectivity-map"
 import { getConnectivityMapFromSimpleRouteJson } from "lib/utils/getConnectivityMapFromSimpleRouteJson"
 import { NetToPointPairsSolver2_OffBoardConnection } from "../../solvers/NetToPointPairsSolver2_OffBoardConnection/NetToPointPairsSolver2_OffBoardConnection"
 import { convertSrjToGraphicsObject } from "lib/utils/convertSrjToGraphicsObject"
-import { PolyanyaMeshSolver } from "../../solvers/PolyanyaSolver/PolyanyaMeshSolver"
-import { PolyanyaPathSolver } from "../../solvers/PolyanyaSolver/PolyanyaPathSolver"
-import { CrossingResolverSolver } from "../../solvers/PolyanyaSolver/CrossingResolverSolver"
+import { GreedySequentialPathSolver } from "../../solvers/PolyanyaSolver/GreedySequentialPathSolver"
 import { PolyanyaOutputSolver } from "../../solvers/PolyanyaSolver/PolyanyaOutputSolver"
 
 type PipelineStep<T extends new (...args: any[]) => BaseSolver> = {
   solverName: string
   solverClass: T
   getConstructorParams: (
-    instance: PolyanyaPipelineSolver,
+    instance: GreedySequentialPipelineSolver,
   ) => ConstructorParameters<T>
-  onSolved?: (instance: PolyanyaPipelineSolver) => void
+  onSolved?: (instance: GreedySequentialPipelineSolver) => void
 }
 
 function definePipelineStep<
   T extends new (...args: any[]) => BaseSolver,
   const P extends ConstructorParameters<T>,
 >(
-  solverName: keyof PolyanyaPipelineSolver,
+  solverName: keyof GreedySequentialPipelineSolver,
   solverClass: T,
-  getConstructorParams: (instance: PolyanyaPipelineSolver) => P,
+  getConstructorParams: (instance: GreedySequentialPipelineSolver) => P,
   opts: {
-    onSolved?: (instance: PolyanyaPipelineSolver) => void
+    onSolved?: (instance: GreedySequentialPipelineSolver) => void
   } = {},
 ): PipelineStep<T> {
   return {
@@ -44,15 +41,13 @@ function definePipelineStep<
   }
 }
 
-export class PolyanyaPipelineSolver extends BaseSolver {
+export class GreedySequentialPipelineSolver extends BaseSolver {
   override getSolverName(): string {
-    return "PolyanyaPipelineSolver"
+    return "GreedySequentialPipelineSolver"
   }
 
   netToPointPairsSolver?: NetToPointPairsSolver2_OffBoardConnection
-  meshSolver?: PolyanyaMeshSolver
-  pathSolver?: PolyanyaPathSolver
-  crossingResolver?: CrossingResolverSolver
+  greedySolver?: GreedySequentialPathSolver
   outputSolver?: PolyanyaOutputSolver
 
   colorMap: Record<string, string>
@@ -84,50 +79,34 @@ export class PolyanyaPipelineSolver extends BaseSolver {
       },
     ),
     definePipelineStep(
-      "meshSolver",
-      PolyanyaMeshSolver,
-      (pps) => [
-        pps.srjWithPointPairs ?? pps.srj,
-        pps.srj.defaultObstacleMargin ?? pps.minTraceWidth,
-      ],
-    ),
-    definePipelineStep(
-      "pathSolver",
-      PolyanyaPathSolver,
+      "greedySolver",
+      GreedySequentialPathSolver,
       (pps) => [
         {
-          mesh: pps.meshSolver!.getMesh(),
           srj: pps.srjWithPointPairs ?? pps.srj,
           colorMap: pps.colorMap,
           minTraceWidth: pps.minTraceWidth,
-        },
-      ],
-    ),
-    definePipelineStep(
-      "crossingResolver",
-      CrossingResolverSolver,
-      (pps) => [
-        {
-          paths: pps.pathSolver!.getResults(),
-          srj: pps.srjWithPointPairs ?? pps.srj,
-          colorMap: pps.colorMap,
-          minTraceWidth: pps.minTraceWidth,
-          layerCount: pps.srj.layerCount,
-          viaDiameter: pps.viaDiameter,
+          margin: pps.srj.defaultObstacleMargin ?? pps.minTraceWidth,
         },
       ],
     ),
     definePipelineStep(
       "outputSolver",
       PolyanyaOutputSolver,
-      (pps) => [
-        {
-          resolvedPaths: pps.crossingResolver!.getResolvedPaths(),
-          srj: pps.srjWithPointPairs ?? pps.srj,
-          minTraceWidth: pps.minTraceWidth,
-          viaDiameter: pps.viaDiameter,
-        },
-      ],
+      (pps) => {
+        const baseSrj = pps.srjWithPointPairs ?? pps.srj
+        const effectiveLayerCount = pps.greedySolver!.getEffectiveLayerCount()
+        return [
+          {
+            resolvedPaths: pps.greedySolver!.getResolvedPaths(),
+            srj: baseSrj.layerCount >= effectiveLayerCount
+              ? baseSrj
+              : { ...baseSrj, layerCount: effectiveLayerCount },
+            minTraceWidth: pps.minTraceWidth,
+            viaDiameter: pps.viaDiameter,
+          },
+        ]
+      },
     ),
   ]
 
@@ -194,8 +173,10 @@ export class PolyanyaPipelineSolver extends BaseSolver {
   }
 
   getOutputSimpleRouteJson(): SimpleRouteJson {
+    const effectiveLayerCount = this.greedySolver?.getEffectiveLayerCount() ?? this.srj.layerCount
     return {
       ...this.srj,
+      layerCount: Math.max(this.srj.layerCount, effectiveLayerCount),
       traces: this.getOutputSimplifiedPcbTraces(),
     }
   }
@@ -204,9 +185,7 @@ export class PolyanyaPipelineSolver extends BaseSolver {
     if (!this.solved && this.activeSubSolver)
       return this.activeSubSolver.visualize()
 
-    const meshViz = this.meshSolver?.visualize()
-    const pathViz = this.pathSolver?.visualize()
-    const crossingViz = this.crossingResolver?.visualize()
+    const greedyViz = this.greedySolver?.visualize()
     const outputViz = this.outputSolver?.visualize()
 
     const { minX, maxX, minY, maxY } = this.srj.bounds
@@ -244,9 +223,7 @@ export class PolyanyaPipelineSolver extends BaseSolver {
 
     const visualizations = [
       problemViz,
-      meshViz,
-      pathViz,
-      crossingViz,
+      greedyViz,
       outputViz,
       this.solved
         ? combineVisualizations(
@@ -260,13 +237,13 @@ export class PolyanyaPipelineSolver extends BaseSolver {
   }
 
   preview(): GraphicsObject {
-    if (this.pathSolver) {
+    if (this.greedySolver) {
       const lines: Line[] = []
-      for (const result of this.pathSolver.results) {
-        if (result.path.length > 1) {
+      for (const rp of this.greedySolver.getResolvedPaths()) {
+        if (rp.route.length > 1) {
           lines.push({
-            points: result.path.map((p) => ({ x: p.x, y: p.y })),
-            strokeColor: this.colorMap[result.connectionName],
+            points: rp.route.map((p) => ({ x: p.x, y: p.y })),
+            strokeColor: this.colorMap[rp.connectionName],
           })
         }
         if (lines.length > 200) break
