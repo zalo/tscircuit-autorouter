@@ -13,6 +13,7 @@ import {
   type RawCdt,
   type CdtEdge,
 } from "./TopologicalCdt"
+import { rubberbandSegment, arcsToPath } from "./TopoRubberBand"
 import {
   type RouteVertex,
   createTempVertex,
@@ -76,7 +77,7 @@ export class TopologicalPathSolver extends BaseSolver {
   }> = []
 
   private resolvedPaths: ResolvedPath[] = []
-  private phase: "build-cdt" | "route" | "space" | "commit" | "done" = "build-cdt"
+  private phase: "build-cdt" | "route" | "space" | "rubberband" | "commit" | "done" = "build-cdt"
   private routeIndex = 0
   private layerNameToZ = new Map<string, number>()
 
@@ -644,6 +645,7 @@ export class TopologicalPathSolver extends BaseSolver {
       case "build-cdt": this.stepBuildCdt(); break
       case "route": this.stepRoute(); break
       case "space": this.stepSpace(); break
+      case "rubberband": this.stepRubberBand(); break
       case "commit": this.stepCommit(); break
       case "done": this.solved = true; break
     }
@@ -725,6 +727,64 @@ export class TopologicalPathSolver extends BaseSolver {
         this.spaceEdge(cdt, z, ei)
       }
     }
+    this.phase = "rubberband"
+  }
+
+  private stepRubberBand() {
+    // gEDA: oproute_rubberband() for each route after space_edge
+    for (const cp of this.committedPaths) {
+      const cdt = this.cdts[cp.layerZ]
+      if (!cdt) continue
+      if (cp.vertices.length < 2) continue
+
+      const start = cp.vertices[0]!
+      const end = cp.vertices[cp.vertices.length - 1]!
+
+      const arcs = rubberbandSegment(
+        cdt,
+        cp.vertices,
+        1, // skip start terminal
+        cp.vertices.length - 1, // skip end terminal
+        { kind: "point", x: start.x, y: start.y },
+        { kind: "point", x: end.x, y: end.y },
+        this.margin,
+        this.minTraceWidth,
+      )
+
+      if (arcs.length > 0) {
+        // Convert arcs to geometric path points
+        const smoothPath = arcsToPath(
+          { x: start.x, y: start.y },
+          { x: end.x, y: end.y },
+          arcs,
+        )
+
+        // Replace vertex positions with the smooth path
+        // Keep the original RouteVertex objects but update coordinates
+        // Create new simplified vertex list from the smooth path
+        const newVertices = smoothPath.map((p, i) => {
+          if (i === 0) return cp.vertices[0]! // keep start
+          if (i === smoothPath.length - 1) return cp.vertices[cp.vertices.length - 1]! // keep end
+          // Create intermediate vertices (not on edges anymore — they're arc points)
+          return {
+            x: p.x,
+            y: p.y,
+            edgeIdx: -1,
+            t: -1,
+            isTemp: false,
+            parent: null,
+            child: null,
+            gcost: 0,
+            hcost: 0,
+            routeName: cp.name,
+            thickness: this.minTraceWidth,
+          }
+        })
+
+        cp.vertices = newVertices
+      }
+    }
+
     this.phase = "commit"
   }
 
