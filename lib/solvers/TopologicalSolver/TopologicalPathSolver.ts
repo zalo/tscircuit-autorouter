@@ -358,9 +358,24 @@ export class TopologicalPathSolver extends BaseSolver {
   // ===== A* ROUTING (gEDA route()) =====
 
   /**
+   * Find the nearest CDT vertex to a point. Used to map terminal
+   * positions to CDT vertices for the direct-connection check.
+   */
+  private nearestCdtVertex(cdt: RawCdt, pt: Point): number {
+    let bestD = Infinity, bestV = -1
+    for (let vi = 0; vi < cdt.pts.length; vi++) {
+      const d = (cdt.pts[vi]!.x - pt.x) ** 2 + (cdt.pts[vi]!.y - pt.y) ** 2
+      if (d < bestD) { bestD = d; bestV = vi }
+    }
+    return bestV
+  }
+
+  /**
    * Route one connection through the CDT using A*.
-   * Places route vertices ON CDT edges. Uses winding checks
-   * to maintain topological consistency.
+   * Direct port of gEDA route():
+   * - Uses vertex identity (not coordinate strings) for closed set
+   * - Direct connection check (gts_vertices_are_connected)
+   * - Proper candidate generation matching gEDA's triangle traversal
    */
   private routeConnection(
     cdt: RawCdt,
@@ -376,13 +391,26 @@ export class TopologicalPathSolver extends BaseSolver {
     srcVertex.gcost = 0
     srcVertex.hcost = distance(conn.start, conn.end)
 
-    // Open list sorted by f-cost
+    // Map destination to nearest CDT vertex for direct-connection checks
+    const destCdtVi = this.nearestCdtVertex(cdt, conn.end)
+
     const open: RouteVertex[] = [srcVertex]
-    const closed = new Set<string>() // "x,y" keys for visited
+    // Position-based closed set: "edgeIdx:t" for edge vertices, "x,y" for terminals
+    const closed = new Set<string>()
+    // Position-based vertex cache: reuse vertices at same position
+    const vertexCache = new Map<string, RouteVertex>()
+    let iterCount = 0
 
-    const tempVertices: RouteVertex[] = [] // for cleanup
+    const posKey = (rv: RouteVertex) =>
+      rv.edgeIdx >= 0 ? `e${rv.edgeIdx}:${rv.t.toFixed(6)}` : `${rv.x.toFixed(4)},${rv.y.toFixed(4)}`
 
-    while (open.length > 0) {
+    const routeStartTime = Date.now()
+    while (open.length > 0 && iterCount < 5000) {
+      iterCount++
+      if (Date.now() - routeStartTime > 2000) {
+        console.warn(`TopologicalPathSolver: A* timeout for ${conn.name} after ${iterCount} iters, open=${open.length} closed=${closed.size} cache=${vertexCache.size}`)
+        return null
+      }
       // Pop lowest f-cost
       let bestIdx = 0
       for (let i = 1; i < open.length; i++) {
@@ -391,38 +419,40 @@ export class TopologicalPathSolver extends BaseSolver {
       const cur = open[bestIdx]!
       open.splice(bestIdx, 1)
 
-      const curKey = `${cur.x.toFixed(4)},${cur.y.toFixed(4)}`
+      const curKey = posKey(cur)
       if (closed.has(curKey)) continue
       closed.add(curKey)
 
-      // Check if we reached the destination triangle
-      const curTri = this.locateTriangle(cdt, cur)
-      if (curTri === endTri) {
-        // Check if we can directly reach the destination
-        const directDist = distance(cur, destVertex)
-        destVertex.parent = cur
-        destVertex.gcost = cur.gcost + directDist
-
-        // Extract path
+      // Check if we reached destination (by position, not object identity)
+      if (distance(cur, destVertex) < 0.1) {
+        // cur IS at the destination — build path
         const path: RouteVertex[] = []
-        let v: RouteVertex | null = destVertex
+        let v: RouteVertex | null = cur
         while (v) { path.push(v); v = v.parent }
         path.reverse()
+        // Ensure last point is exactly at dest
+        if (path.length > 0) {
+          const last = path[path.length - 1]!
+          if (distance(last, destVertex) > 0.01) {
+            path.push(destVertex)
+            destVertex.parent = last
+          }
+        }
         return path
       }
 
       // Generate candidates
-      const candidates = this.computeCandidatePoints(cdt, layerZ, cur, destVertex)
+      const candidates = this.computeCandidatePoints(cdt, layerZ, cur, destVertex, destCdtVi)
 
       for (const cand of candidates) {
-        const candKey = `${cand.x.toFixed(4)},${cand.y.toFixed(4)}`
+        const candKey = posKey(cand)
         if (closed.has(candKey)) continue
 
         const g = cur.gcost + distance(cur, cand)
         const h = distance(cand, destVertex)
 
-        // Check if already in open list with better cost
-        const existing = open.find((o) => Math.abs(o.x - cand.x) < 1e-6 && Math.abs(o.y - cand.y) < 1e-6)
+        // Reuse existing vertex at same position
+        const existing = vertexCache.get(candKey)
         if (existing) {
           if (g < existing.gcost) {
             existing.gcost = g
@@ -435,87 +465,109 @@ export class TopologicalPathSolver extends BaseSolver {
         cand.gcost = g
         cand.hcost = h
         cand.parent = cur
+        vertexCache.set(candKey, cand)
         open.push(cand)
-        tempVertices.push(cand)
       }
     }
 
-    return null // No path found
+    if (iterCount >= 20000) {
+      console.warn(`TopologicalPathSolver: A* exhausted 20000 iterations for ${conn.name}, open=${open.length} closed=${closed.size}`)
+    }
+    return null
   }
 
   /**
-   * Generate candidate points from current position (gEDA compute_candidate_points).
-   * If cur is a fixed vertex: explore all adjacent triangles.
-   * If cur is on an edge: explore only the triangle on the OPPOSITE side from parent (winding check).
+   * Generate candidate points — port of gEDA compute_candidate_points().
+   *
+   * Key difference from previous implementation:
+   * - From a CDT vertex: check direct connection first, then only generate
+   *   candidates on the OPPOSITE edge of each adjacent triangle
+   * - From a temp vertex on edge: winding check, then candidates on the
+   *   two other edges of the opposite-side triangle
    */
   private computeCandidatePoints(
     cdt: RawCdt,
     layerZ: number,
     cur: RouteVertex,
     dest: RouteVertex,
+    destCdtVi: number,
   ): RouteVertex[] {
     const candidates: RouteVertex[] = []
 
     if (cur.edgeIdx < 0) {
-      // Fixed vertex (CDT vertex or terminal) — explore all adjacent triangles
-      const curTri = this.locateTriangle(cdt, cur)
-      if (curTri < 0) return candidates
+      // Fixed vertex or CDT vertex — find nearest CDT vertex
+      const curCdtVi = this.nearestCdtVertex(cdt, cur)
 
-      // Find all triangles sharing this point
-      const tris = this.findTrianglesContainingPoint(cdt, cur)
+      // gEDA direct connection check:
+      // If curpoint is directly connected to dest via a non-constraint,
+      // non-routed CDT edge, go straight there
+      if (curCdtVi >= 0 && destCdtVi >= 0 && cdt.vertexNeighbors[curCdtVi]?.has(destCdtVi)) {
+        const ek = this.edgeKey(curCdtVi, destCdtVi)
+        const ei = cdt.edgeMap.get(ek)
+        if (ei !== undefined) {
+          const edge = cdt.edges[ei]!
+          if (!edge.isConstraint && this.getEdgeRouting(layerZ, ei).length === 0) {
+            // Direct connection! Return dest as only candidate
+            return [dest]
+          }
+        }
+      }
+
+      // Explore all adjacent triangles (gEDA: gts_vertex_triangles)
+      const tris = cdt.vertexTriangles[curCdtVi] ?? this.findTrianglesContainingPoint(cdt, cur)
       for (const ti of tris) {
         const tri = cdt.triangles[ti]!
         if (tri.obstacle) continue
-        // Generate candidates on the two edges NOT adjacent to cur
-        const edgePairs = [
-          { slot: 0, v0: tri.v[1], v1: tri.v[2] },
-          { slot: 1, v0: tri.v[2], v1: tri.v[0] },
-          { slot: 2, v0: tri.v[0], v1: tri.v[1] },
-        ]
-        for (const ep of edgePairs) {
-          const edgeIdx = cdt.edgeMap.get(this.edgeKey(ep.v0, ep.v1))
-          if (edgeIdx === undefined) continue
-          const edge = cdt.edges[edgeIdx]!
+
+        // Find the opposite edge from cur (gEDA: gts_triangle_edge_opposite)
+        // The opposite edge is the one that doesn't contain curCdtVi
+        for (let slot = 0; slot < 3; slot++) {
+          const va = tri.v[slot]!, vb = tri.v[(slot + 1) % 3]!
+          // This edge is opposite cur if neither endpoint is curCdtVi
+          if (va === curCdtVi || vb === curCdtVi) continue
+
+          const ek = this.edgeKey(va, vb)
+          const ei = cdt.edgeMap.get(ek)
+          if (ei === undefined) continue
+          const edge = cdt.edges[ei]!
           if (edge.isConstraint) continue
 
-          const cands = this.candidateVerticesOnEdge(cdt, layerZ, edgeIdx, dest.thickness)
+          const cands = this.candidateVerticesOnEdge(cdt, layerZ, ei, dest.thickness)
           candidates.push(...cands)
         }
       }
     } else {
-      // Temp vertex on an edge — use winding check to pick correct triangle
+      // Temp vertex on edge — winding check (gEDA prevwind)
       const edge = cdt.edges[cur.edgeIdx]!
       const ep0 = cdt.pts[edge.v0]!, ep1 = cdt.pts[edge.v1]!
 
-      // Winding of parent relative to edge
       const parentWind = cur.parent
         ? this.wind(ep0.x, ep0.y, ep1.x, ep1.y, cur.parent.x, cur.parent.y)
         : 0
 
-      // Explore the triangle on the opposite side from parent
+      // Only explore the triangle on the OPPOSITE side from parent
       for (const triIdx of [edge.t0, edge.t1]) {
         if (triIdx < 0) continue
         const tri = cdt.triangles[triIdx]!
         if (tri.obstacle) continue
 
-        // Find the opposite vertex of this triangle
         const oppIdx = tri.v.find((vi) => vi !== edge.v0 && vi !== edge.v1)
         if (oppIdx === undefined) continue
         const oppV = cdt.pts[oppIdx]!
 
         const oppWind = this.wind(ep0.x, ep0.y, ep1.x, ep1.y, oppV.x, oppV.y)
-
-        // gEDA: only explore if oppWind != parentWind (opposite side)
         if (parentWind !== 0 && oppWind === parentWind) continue
 
-        // Generate candidates on the two edges of this triangle that aren't cur.edgeIdx
-        const triEdges = [
-          [tri.v[0], tri.v[1]],
-          [tri.v[1], tri.v[2]],
-          [tri.v[2], tri.v[0]],
-        ]
-        for (const [va, vb] of triEdges) {
-          const ek = this.edgeKey(va!, vb!)
+        // gEDA: check if dest is the opposite vertex
+        if (oppIdx === destCdtVi) {
+          candidates.push(dest)
+          continue
+        }
+
+        // Generate candidates on the two OTHER edges of this triangle
+        for (let slot = 0; slot < 3; slot++) {
+          const va = tri.v[slot]!, vb = tri.v[(slot + 1) % 3]!
+          const ek = this.edgeKey(va, vb)
           const ei = cdt.edgeMap.get(ek)
           if (ei === undefined || ei === cur.edgeIdx) continue
           const e = cdt.edges[ei]!
@@ -530,7 +582,7 @@ export class TopologicalPathSolver extends BaseSolver {
     return candidates
   }
 
-  /** Find all non-obstacle triangles containing/adjacent to a point */
+  /** Fallback: find triangles containing a point by brute force */
   private findTrianglesContainingPoint(cdt: RawCdt, pt: Point): number[] {
     const tris: number[] = []
     for (let ti = 0; ti < cdt.triangles.length; ti++) {
@@ -538,7 +590,6 @@ export class TopologicalPathSolver extends BaseSolver {
       if (tri.obstacle) continue
       if (this.ptInTri(cdt.pts, tri.v, pt)) tris.push(ti)
     }
-    // If none found by containment, find nearest
     if (tris.length === 0) {
       const nearest = this.locateTriangle(cdt, pt)
       if (nearest >= 0) tris.push(nearest)
@@ -548,7 +599,7 @@ export class TopologicalPathSolver extends BaseSolver {
 
   /**
    * Generate candidate vertices along an edge, finding gaps between
-   * existing route vertices (gEDA-style).
+   * existing route vertices (gEDA candidate_vertices).
    */
   private candidateVerticesOnEdge(
     cdt: RawCdt,
@@ -708,8 +759,8 @@ export class TopologicalPathSolver extends BaseSolver {
       }
 
       if (conn.startLayerZ === conn.endLayerZ) tryLayer(conn.startLayerZ)
-      if (!routed) tryLayer(preferredLayer)
-      if (!routed) tryLayer(altLayer)
+      if (!routed && preferredLayer !== conn.startLayerZ) tryLayer(preferredLayer)
+      if (!routed && altLayer !== conn.startLayerZ && altLayer !== preferredLayer) tryLayer(altLayer)
     }
 
     this.routeIndex = end

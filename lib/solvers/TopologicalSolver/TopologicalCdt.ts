@@ -65,6 +65,12 @@ export interface RawCdt {
   obstacleVertices: Set<number>
   /** Map from obstacle index to its constraint vertex indices */
   obstacleRings: number[][]
+  /** Vertex → list of adjacent triangle indices (gEDA gts_vertex_triangles) */
+  vertexTriangles: number[][]
+  /** Vertex → list of adjacent edge indices */
+  vertexEdges: number[][]
+  /** Vertex → set of connected vertex indices (gEDA gts_vertices_are_connected) */
+  vertexNeighbors: Set<number>[]
 }
 
 function edgeKey(a: number, b: number): string {
@@ -326,6 +332,26 @@ export function buildRawCdt(
     })
   }
 
+  // --- Build vertex adjacency maps (gEDA gts_vertex_triangles etc.) ---
+  const vertexTriangles: number[][] = Array.from({ length: points.length }, () => [])
+  const vertexEdgesAdj: number[][] = Array.from({ length: points.length }, () => [])
+  const vertexNeighbors: Set<number>[] = Array.from({ length: points.length }, () => new Set())
+
+  for (let ti = 0; ti < cdtTriangles.length; ti++) {
+    const tri = cdtTriangles[ti]!
+    for (const vi of tri.v) {
+      vertexTriangles[vi]!.push(ti)
+    }
+  }
+
+  for (let ei = 0; ei < cdtEdges.length; ei++) {
+    const edge = cdtEdges[ei]!
+    vertexEdgesAdj[edge.v0]!.push(ei)
+    vertexEdgesAdj[edge.v1]!.push(ei)
+    vertexNeighbors[edge.v0]!.add(edge.v1)
+    vertexNeighbors[edge.v1]!.add(edge.v0)
+  }
+
   return {
     pts: points,
     triangles: cdtTriangles,
@@ -333,5 +359,8 @@ export function buildRawCdt(
     edgeMap: edgeMapResult,
     obstacleVertices: obstacleVertexSet,
     obstacleRings,
+    vertexTriangles,
+    vertexEdges: vertexEdgesAdj,
+    vertexNeighbors,
   }
 }
