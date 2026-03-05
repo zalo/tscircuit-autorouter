@@ -828,24 +828,205 @@ export class TopologicalPathSolver extends BaseSolver {
   }
 
   private finishRubberBand() {
-    // Simplify paths: remove crossing points where the straight line
-    // from prev→next doesn't cross any constraint edge. This eliminates
-    // zigzag from the CDT structure without changing the topological embedding.
+    // Re-run edge spacing to maximize geometric divergence
+    for (let z = 0; z < this.layerCount; z++) {
+      const cdt = this.cdts[z]
+      if (cdt) this.spaceAllEdges(cdt)
+    }
+    for (const route of this.routes) {
+      const cdt = this.cdts[route.routeLayerZ]
+      if (cdt) this.rebuildPathFromCrossings(cdt, route)
+    }
+
+    // Simplify paths: remove crossings where the straight line from
+    // prev→next doesn't cross any constraint edge. This eliminates
+    // CDT-structure zigzag without changing the topological embedding.
+    // Note: this may reduce separation between routes that share edge
+    // corridors, but the alternative (keeping crossings) causes worse
+    // overlaps because CDT vertex convergence is the actual overlap source.
     for (const route of this.routes) {
       const cdt = this.cdts[route.routeLayerZ]
       if (cdt) this.simplifyPath(cdt, route)
     }
+
     this.phase = "commit"
   }
 
   /**
-   * Remove unnecessary crossing points from a route path.
-   * A crossing is unnecessary if the straight line from its predecessor
-   * to its successor doesn't cross any constraint edge (obstacle boundary).
-   * This preserves the topological embedding while eliminating zigzag.
-   *
-   * Uses iterative greedy removal — keep removing points until no more
-   * can be removed without crossing a constraint.
+   * For each pair of route segments on the same layer that are closer
+   * than minSpacing, push them apart by offsetting perpendicular to
+   * the segment direction. Like gEDA's space_edge() but operating on
+   * the simplified geometric paths.
+   */
+  private separateOverlappingTraces() {
+    const minSpacing = this.minTraceWidth + this.margin
+
+    // Multiple passes for convergence
+    for (let pass = 0; pass < 5; pass++) {
+      let anyMoved = false
+
+      for (let i = 0; i < this.routes.length; i++) {
+        const ri = this.routes[i]!
+        for (let j = i + 1; j < this.routes.length; j++) {
+          const rj = this.routes[j]!
+          if (ri.routeLayerZ !== rj.routeLayerZ) continue
+
+          // Skip same net
+          const netI = TopologicalPathSolver.baseNetName(ri.connectionName)
+          const netJ = TopologicalPathSolver.baseNetName(rj.connectionName)
+          if (netI === netJ) continue
+
+          // Check all segment pairs
+          for (let si = 0; si < ri.path.length - 1; si++) {
+            for (let sj = 0; sj < rj.path.length - 1; sj++) {
+              const a1 = ri.path[si]!, a2 = ri.path[si + 1]!
+              const b1 = rj.path[sj]!, b2 = rj.path[sj + 1]!
+
+              // Find closest points between segments
+              const result = this.closestPointsBetweenSegments(a1, a2, b1, b2)
+              if (!result || result.dist >= minSpacing) continue
+
+              // Push apart: offset both segments perpendicular to their midline
+              const gap = minSpacing - result.dist
+              const halfGap = gap / 2 + 0.01 // small extra margin
+
+              // Direction to push: perpendicular to the line between closest points
+              let dx = result.pb.x - result.pa.x
+              let dy = result.pb.y - result.pa.y
+              const d = Math.hypot(dx, dy)
+              if (d < 1e-9) {
+                // Points coincide — use perpendicular to segment direction
+                const sdx = a2.x - a1.x, sdy = a2.y - a1.y
+                const slen = Math.hypot(sdx, sdy)
+                if (slen < 1e-9) continue
+                dx = -sdy / slen
+                dy = sdx / slen
+              } else {
+                dx /= d
+                dy /= d
+              }
+
+              // Push movable interior points (don't move start/end)
+              if (si > 0 && si < ri.path.length - 1) {
+                ri.path[si] = { x: ri.path[si]!.x - dx * halfGap, y: ri.path[si]!.y - dy * halfGap }
+                anyMoved = true
+              }
+              if (si + 1 > 0 && si + 1 < ri.path.length - 1) {
+                ri.path[si + 1] = { x: ri.path[si + 1]!.x - dx * halfGap, y: ri.path[si + 1]!.y - dy * halfGap }
+                anyMoved = true
+              }
+              if (sj > 0 && sj < rj.path.length - 1) {
+                rj.path[sj] = { x: rj.path[sj]!.x + dx * halfGap, y: rj.path[sj]!.y + dy * halfGap }
+                anyMoved = true
+              }
+              if (sj + 1 > 0 && sj + 1 < rj.path.length - 1) {
+                rj.path[sj + 1] = { x: rj.path[sj + 1]!.x + dx * halfGap, y: rj.path[sj + 1]!.y + dy * halfGap }
+                anyMoved = true
+              }
+            }
+          }
+        }
+      }
+
+      if (!anyMoved) break
+    }
+  }
+
+  private closestPointsBetweenSegments(
+    a1: Point, a2: Point, b1: Point, b2: Point,
+  ): { pa: Point; pb: Point; dist: number } | null {
+    // Parametric closest approach between two line segments
+    const dax = a2.x - a1.x, day = a2.y - a1.y
+    const dbx = b2.x - b1.x, dby = b2.y - b1.y
+    const abx = b1.x - a1.x, aby = b1.y - a1.y
+
+    const lenA = Math.hypot(dax, day)
+    const lenB = Math.hypot(dbx, dby)
+    if (lenA < 1e-9 || lenB < 1e-9) return null
+
+    // Sample several points along each segment and find minimum
+    let bestDist = Infinity
+    let bestPa: Point = a1, bestPb: Point = b1
+    const steps = 8
+    for (let sa = 0; sa <= steps; sa++) {
+      const ta = sa / steps
+      const pax = a1.x + ta * dax, pay = a1.y + ta * day
+      for (let sb = 0; sb <= steps; sb++) {
+        const tb = sb / steps
+        const pbx = b1.x + tb * dbx, pby = b1.y + tb * dby
+        const d = Math.hypot(pax - pbx, pay - pby)
+        if (d < bestDist) {
+          bestDist = d
+          bestPa = { x: pax, y: pay }
+          bestPb = { x: pbx, y: pby }
+        }
+      }
+    }
+
+    return { pa: bestPa, pb: bestPb, dist: bestDist }
+  }
+
+  /**
+   * Conservative path simplification: remove crossing points ONLY if:
+   * 1. The straight line prev→next doesn't cross any constraint edge
+   * 2. The CDT edge this crossing is on has NO other routes on it
+   *    (shared edges must keep their crossings for route separation)
+   */
+  private simplifyPathConservative(cdt: RawCdt, route: TopoRouteState) {
+    const ec = (route as any)._edgesCrossed as number[] | undefined
+    if (!ec) return
+
+    // Build set of edges that are shared with other routes
+    const sharedEdges = new Set<number>()
+    for (const edgeIdx of ec) {
+      const edge = cdt.edges[edgeIdx]!
+      if (edge.crossings.length > 1) sharedEdges.add(edgeIdx)
+    }
+
+    // Collect constraint segments
+    const constraintSegs: { x1: number; y1: number; x2: number; y2: number }[] = []
+    for (const edge of cdt.edges) {
+      if (!edge.isConstraint) continue
+      const p0 = cdt.pts[edge.v0]!, p1 = cdt.pts[edge.v1]!
+      constraintSegs.push({ x1: p0.x, y1: p0.y, x2: p1.x, y2: p1.y })
+    }
+
+    let changed = true
+    while (changed) {
+      changed = false
+      const path = route.path
+      for (let i = 1; i < path.length - 1; i++) {
+        const edgeIdx = ec[i - 1]
+        if (edgeIdx === undefined) continue
+
+        // Keep shared-edge crossings
+        if (sharedEdges.has(edgeIdx)) continue
+
+        const prev = path[i - 1]!, next = path[i + 1]!
+
+        let crossesConstraint = false
+        for (const cs of constraintSegs) {
+          if (this.segmentsIntersect(
+            prev.x, prev.y, next.x, next.y,
+            cs.x1, cs.y1, cs.x2, cs.y2,
+          )) {
+            crossesConstraint = true
+            break
+          }
+        }
+
+        if (!crossesConstraint) {
+          path.splice(i, 1)
+          ec.splice(i - 1, 1)
+          changed = true
+          break
+        }
+      }
+    }
+  }
+
+  /**
+   * Aggressive path simplification (used when overlap prevention not needed).
    */
   private simplifyPath(cdt: RawCdt, route: TopoRouteState) {
     // Collect constraint segments for intersection testing
