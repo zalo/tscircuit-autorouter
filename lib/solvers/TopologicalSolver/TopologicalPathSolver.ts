@@ -77,7 +77,7 @@ export class TopologicalPathSolver extends BaseSolver {
   }> = []
 
   private resolvedPaths: ResolvedPath[] = []
-  private phase: "build-cdt" | "order" | "route" | "roar" | "space" | "rubberband" | "commit" | "done" = "build-cdt"
+  private phase: "build-cdt" | "order" | "route" | "roar" | "detour" | "space" | "rubberband" | "commit" | "done" = "build-cdt"
   private failedConnections: (typeof this.connections)[0][] = []
   private roarPassCount = 0
   /** When true, segment overlap check is disabled (gEDA TOPOROUTER_FLAG_LEASTINVALID) */
@@ -1375,6 +1375,7 @@ export class TopologicalPathSolver extends BaseSolver {
       case "order": this.stepOrderNets(); break
       case "route": this.stepRoute(); break
       case "roar": this.stepRoar(); break
+      case "detour": this.stepDetour(); break
       case "space": this.stepSpace(); break
       case "rubberband": this.stepRubberBand(); break
       case "commit": this.stepCommit(); break
@@ -1568,7 +1569,7 @@ export class TopologicalPathSolver extends BaseSolver {
    */
   private stepRoar() {
     if (this.roarPassCount >= 6 || this.failedConnections.length === 0) {
-      this.phase = "space"
+      this.phase = "detour"
       return
     }
 
@@ -1578,8 +1579,77 @@ export class TopologicalPathSolver extends BaseSolver {
 
     // If no improvement, stop
     if (this.failedConnections.length >= prevFailed) {
-      this.phase = "space"
+      this.phase = "detour"
     }
+  }
+
+  /**
+   * Port of gEDA detour_router():
+   * After all routing, optimize routes with excessive detour by ripping
+   * them up and re-routing through potentially better paths.
+   */
+  private stepDetour() {
+    const DETOUR_THRESHOLD = 0.1 // 10% detour threshold
+
+    // Calculate detour for each committed route
+    const routeDetours: Array<{ cpIdx: number; detour: number; conn: { name: string; originalStart: Point; originalEnd: Point; start: Point; end: Point; startLayerZ: number; endLayerZ: number } }> = []
+
+    for (let cpIdx = 0; cpIdx < this.committedPaths.length; cpIdx++) {
+      const cp = this.committedPaths[cpIdx]!
+      const isolatedScore = this.connectionScores.get(cp.name)
+      if (!isolatedScore || !isFinite(isolatedScore)) continue
+
+      let currentScore = 0
+      for (let i = 1; i < cp.vertices.length; i++) {
+        currentScore += distance(cp.vertices[i-1]!, cp.vertices[i]!)
+      }
+
+      const detour = currentScore - isolatedScore
+      if (detour > DETOUR_THRESHOLD) {
+        const conn = this.connections.find(c => c.name === cp.name)
+        if (conn) routeDetours.push({ cpIdx, detour, conn })
+      }
+    }
+
+    // Sort by detour descending (most detoured first)
+    routeDetours.sort((a, b) => b.detour - a.detour)
+
+    // Try to improve each detoured route
+    for (const { conn } of routeDetours) {
+      const cpIdx = this.committedPaths.findIndex(cp => cp.name === conn.name)
+      if (cpIdx < 0) continue
+
+      const cp = this.committedPaths[cpIdx]!
+      let prevScore = 0
+      for (let i = 1; i < cp.vertices.length; i++) {
+        prevScore += distance(cp.vertices[i-1]!, cp.vertices[i]!)
+      }
+      const savedVertices = [...cp.vertices]
+      const savedLayerZ = cp.layerZ
+
+      // Remove current route
+      this.removeRoute(cpIdx)
+
+      // Try re-routing (will use ROAR if needed)
+      if (this.roarRoute(conn)) {
+        // Check if score improved
+        const newCp = this.committedPaths.find(c => c.name === conn.name)
+        if (newCp) {
+          let newScore = 0
+          for (let i = 1; i < newCp.vertices.length; i++) {
+            newScore += distance(newCp.vertices[i-1]!, newCp.vertices[i]!)
+          }
+          if (newScore < prevScore) continue // Improvement — keep
+        }
+      }
+
+      // Rollback: re-route failed or didn't improve
+      const rollbackIdx = this.committedPaths.findIndex(c => c.name === conn.name)
+      if (rollbackIdx >= 0) this.removeRoute(rollbackIdx)
+      this.applyRoute(conn, savedVertices, savedLayerZ)
+    }
+
+    this.phase = "space"
   }
 
   private stepSpace() {
