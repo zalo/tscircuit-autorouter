@@ -334,8 +334,13 @@ export class TopologicalPathSolver extends BaseSolver {
     const tLow = Math.min(v1t, v2t)
     const tHigh = Math.max(v1t, v2t)
 
+    if (gapLen < ms) {
+      // Gap too small to fit any vertex with clearance
+      return []
+    }
+
     if (v1ms + v2ms + ms >= gapLen) {
-      // Tight: single midpoint
+      // Tight: single midpoint (gEDA behavior)
       const tMid = (tLow + tHigh) / 2
       return [createTempVertex(edgeIdx, tMid, ep0, ep1, destThickness)]
     }
