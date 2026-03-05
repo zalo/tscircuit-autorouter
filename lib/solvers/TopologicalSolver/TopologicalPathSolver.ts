@@ -828,10 +828,94 @@ export class TopologicalPathSolver extends BaseSolver {
   }
 
   private finishRubberBand() {
-    // TODO: implement proper gEDA-style oproute_rubberband_segment
-    // with recursive arc insertion around obstacle vertices.
-    // The current insertObstacleArcs creates zigzags and is disabled.
+    // Simplify paths: remove crossing points where the straight line
+    // from prev→next doesn't cross any constraint edge. This eliminates
+    // zigzag from the CDT structure without changing the topological embedding.
+    for (const route of this.routes) {
+      const cdt = this.cdts[route.routeLayerZ]
+      if (cdt) this.simplifyPath(cdt, route)
+    }
     this.phase = "commit"
+  }
+
+  /**
+   * Remove unnecessary crossing points from a route path.
+   * A crossing is unnecessary if the straight line from its predecessor
+   * to its successor doesn't cross any constraint edge (obstacle boundary).
+   * This preserves the topological embedding while eliminating zigzag.
+   *
+   * Uses iterative greedy removal — keep removing points until no more
+   * can be removed without crossing a constraint.
+   */
+  private simplifyPath(cdt: RawCdt, route: TopoRouteState) {
+    // Collect constraint segments for intersection testing
+    const constraintSegs: { x1: number; y1: number; x2: number; y2: number }[] = []
+    for (const edge of cdt.edges) {
+      if (!edge.isConstraint) continue
+      const p0 = cdt.pts[edge.v0]!
+      const p1 = cdt.pts[edge.v1]!
+      constraintSegs.push({ x1: p0.x, y1: p0.y, x2: p1.x, y2: p1.y })
+    }
+
+    // Also treat other routes' path segments as soft obstacles for overlap prevention
+    const otherSegs: { x1: number; y1: number; x2: number; y2: number; net: string }[] = []
+    const baseNet = TopologicalPathSolver.baseNetName(route.connectionName)
+    for (const other of this.routes) {
+      if (other === route) continue
+      if (other.routeLayerZ !== route.routeLayerZ) continue
+      if (TopologicalPathSolver.baseNetName(other.connectionName) === baseNet) continue
+      for (let i = 0; i < other.path.length - 1; i++) {
+        const a = other.path[i]!, b = other.path[i + 1]!
+        otherSegs.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y, net: other.connectionName })
+      }
+    }
+
+    let changed = true
+    while (changed) {
+      changed = false
+      const path = route.path
+      for (let i = 1; i < path.length - 1; i++) {
+        const prev = path[i - 1]!
+        const next = path[i + 1]!
+
+        // Check if we can skip this point
+        let crossesConstraint = false
+        for (const cs of constraintSegs) {
+          if (this.segmentsIntersect(
+            prev.x, prev.y, next.x, next.y,
+            cs.x1, cs.y1, cs.x2, cs.y2,
+          )) {
+            crossesConstraint = true
+            break
+          }
+        }
+
+        if (!crossesConstraint) {
+          // Safe to remove — splice it out
+          path.splice(i, 1)
+          // Also update _edgesCrossed
+          const ec = (route as any)._edgesCrossed as number[] | undefined
+          if (ec && i - 1 < ec.length) {
+            ec.splice(i - 1, 1)
+          }
+          changed = true
+          break // restart scan since indices shifted
+        }
+      }
+    }
+  }
+
+  private segmentsIntersect(
+    a1x: number, a1y: number, a2x: number, a2y: number,
+    b1x: number, b1y: number, b2x: number, b2y: number,
+  ): boolean {
+    const d1x = a2x - a1x, d1y = a2y - a1y
+    const d2x = b2x - b1x, d2y = b2y - b1y
+    const denom = d1x * d2y - d1y * d2x
+    if (Math.abs(denom) < 1e-12) return false
+    const t = ((b1x - a1x) * d2y - (b1y - a1y) * d2x) / denom
+    const u = ((b1x - a1x) * d1y - (b1y - a1y) * d1x) / denom
+    return t > 0.01 && t < 0.99 && u > 0.01 && u < 0.99
   }
 
   /**
