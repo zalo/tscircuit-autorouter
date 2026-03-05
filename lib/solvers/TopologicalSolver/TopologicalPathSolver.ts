@@ -285,22 +285,27 @@ export class TopologicalPathSolver extends BaseSolver {
     return cdt.edges[edgeIdx]!.length
   }
 
-  /** Edge flow = total spacing consumed by existing route vertices */
+  /** Edge flow = total spacing consumed by existing route vertices.
+   *  gEDA: uses per-vertex thickness and keepaway. Edge endpoints (CDT vertices)
+   *  contribute their obstacle keepaway if they're obstacle vertices. */
   private edgeFlow(layerZ: number, cdt: RawCdt, edgeIdx: number, destThickness: number): number {
     const routing = this.getEdgeRouting(layerZ, edgeIdx)
     if (routing.length === 0) return 0
     const edge = cdt.edges[edgeIdx]!
-    let flow = 0
-    const ep0 = cdt.pts[edge.v0]!, ep1 = cdt.pts[edge.v1]!
 
+    // Edge endpoint effective thickness: if it's an obstacle vertex, use margin as keepaway
+    const v0thick = cdt.obstacleVertices.has(edge.v0) ? this.margin * 2 : 0
+    const v1thick = cdt.obstacleVertices.has(edge.v1) ? this.margin * 2 : 0
+
+    let flow = 0
     // Flow from edge v0 to first routing vertex
-    flow += minSpacing({ thickness: 0 }, routing[0]!, this.margin)
+    flow += minSpacing({ thickness: v0thick }, routing[0]!, this.margin)
     // Flow between consecutive routing vertices
     for (let i = 0; i < routing.length - 1; i++) {
       flow += minSpacing(routing[i]!, routing[i + 1]!, this.margin)
     }
     // Flow from last routing vertex to edge v1
-    flow += minSpacing(routing[routing.length - 1]!, { thickness: 0 }, this.margin)
+    flow += minSpacing(routing[routing.length - 1]!, { thickness: v1thick }, this.margin)
     return flow
   }
 
@@ -681,12 +686,28 @@ export class TopologicalPathSolver extends BaseSolver {
     if (flow >= edgeLen) return []
 
     const gapLen = Math.abs(v2t - v1t) * edgeLen
-    const ms = this.minTraceWidth + this.margin
-    const v1ms = ms // spacing from v1 side
-    const v2ms = ms // spacing from v2 side
 
-    const tLow = Math.min(v1t, v2t)
-    const tHigh = Math.max(v1t, v2t)
+    // gEDA: v1ms = min_spacing(v1, dest), v2ms = min_spacing(v2, dest)
+    // v1/v2 are the gap boundaries — either CDT vertices (obstacle corners)
+    // or existing route vertices. Use their actual thickness.
+    const routing = this.getEdgeRouting(layerZ, edgeIdx)
+    const tLowBound = Math.min(v1t, v2t)
+    const tHighBound = Math.max(v1t, v2t)
+
+    // Find what's at each boundary
+    const lowThick = tLowBound <= 0.01
+      ? (cdt.obstacleVertices.has(edge.v0) ? this.margin * 2 : 0)
+      : (routing.find(r => Math.abs(r.t - tLowBound) < 0.001)?.thickness ?? 0)
+    const highThick = tHighBound >= 0.99
+      ? (cdt.obstacleVertices.has(edge.v1) ? this.margin * 2 : 0)
+      : (routing.find(r => Math.abs(r.t - tHighBound) < 0.001)?.thickness ?? 0)
+
+    const v1ms = minSpacing({ thickness: lowThick }, { thickness: destThickness }, this.margin)
+    const v2ms = minSpacing({ thickness: highThick }, { thickness: destThickness }, this.margin)
+    const ms = minSpacing({ thickness: destThickness }, { thickness: destThickness }, this.margin)
+
+    const tLow = tLowBound
+    const tHigh = tHighBound
 
     if (gapLen < ms) {
       // Gap too small to fit any vertex with clearance
