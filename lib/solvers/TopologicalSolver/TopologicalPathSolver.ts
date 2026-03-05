@@ -519,26 +519,36 @@ export class TopologicalPathSolver extends BaseSolver {
       }
 
       // Explore all adjacent triangles (gEDA: gts_vertex_triangles)
+      // For each triangle, generate candidates on the OPPOSITE edge only
+      // (gEDA triangle_candidate_points_from_vertex)
       const tris = cdt.vertexTriangles[curCdtVi] ?? this.findTrianglesContainingPoint(cdt, cur)
       for (const ti of tris) {
         const tri = cdt.triangles[ti]!
         if (tri.obstacle) continue
 
-        // Find the opposite edge from cur (gEDA: gts_triangle_edge_opposite)
-        // The opposite edge is the one that doesn't contain curCdtVi
+        // Find the opposite edge (the one edge that doesn't contain curCdtVi)
         for (let slot = 0; slot < 3; slot++) {
           const va = tri.v[slot]!, vb = tri.v[(slot + 1) % 3]!
-          // This edge is opposite cur if neither endpoint is curCdtVi
           if (va === curCdtVi || vb === curCdtVi) continue
 
+          // This is the opposite edge
           const ek = this.edgeKey(va, vb)
           const ei = cdt.edgeMap.get(ek)
           if (ei === undefined) continue
           const edge = cdt.edges[ei]!
+
+          // gEDA: constraint edges of different nets are impassable
           if (edge.isConstraint) continue
+
+          // Check if dest vertex is on this edge
+          if (va === destCdtVi || vb === destCdtVi) {
+            candidates.push(dest)
+            continue
+          }
 
           const cands = this.candidateVerticesOnEdge(cdt, layerZ, ei, dest.thickness)
           candidates.push(...cands)
+          break // Only one opposite edge per triangle
         }
       }
     } else {
@@ -566,10 +576,26 @@ export class TopologicalPathSolver extends BaseSolver {
         // gEDA: check if dest is the opposite vertex
         if (oppIdx === destCdtVi) {
           candidates.push(dest)
-          continue
+          break // gEDA breaks after finding the opposite-side triangle
         }
 
-        // Generate candidates on the two OTHER edges of this triangle
+        // gEDA triangle_candidate_points_from_edge:
+        // Generate candidates on the OPPOSITE edge of this triangle
+        // (the edge that doesn't share a vertex with cur.edgeIdx's endpoints
+        //  AND doesn't share a vertex with cur.edgeIdx)
+        // In practice: the opposite edge from the entry edge in this triangle
+        // is the edge connecting the two vertices that aren't on cur.edgeIdx
+        // But since oppIdx IS the vertex not on cur.edgeIdx, the opposite edge
+        // is the one connecting the two cur.edgeIdx endpoints: edge.v0→edge.v1
+        // which IS cur.edgeIdx. So actually we want the two edges connecting
+        // oppIdx to edge.v0 and edge.v1 respectively.
+        //
+        // gEDA generates candidates on op_e (edge opposite to vertex v in triangle)
+        // When expanding from edge E, the "vertex" is oppIdx, so op_e is E itself.
+        // But we already came from E! So gEDA actually generates on e1 and e2
+        // (the edges from oppV to E's endpoints), finding gaps via parent/child.
+        //
+        // For now: generate on both side edges (e1, e2) but with proper gap finding
         for (let slot = 0; slot < 3; slot++) {
           const va = tri.v[slot]!, vb = tri.v[(slot + 1) % 3]!
           const ek = this.edgeKey(va, vb)
@@ -581,6 +607,8 @@ export class TopologicalPathSolver extends BaseSolver {
           const cands = this.candidateVerticesOnEdge(cdt, layerZ, ei, dest.thickness)
           candidates.push(...cands)
         }
+
+        break // gEDA breaks after finding the opposite-side triangle
       }
     }
 
@@ -787,28 +815,16 @@ export class TopologicalPathSolver extends BaseSolver {
   }
 
   private stepRubberBand() {
-    // Collect constraint segments for simplification
-    const constraintSegsPerLayer: Map<number, { x1: number; y1: number; x2: number; y2: number }[]> = new Map()
-    for (let z = 0; z < this.layerCount; z++) {
-      const cdt = this.cdts[z]
-      if (!cdt) continue
-      const segs: { x1: number; y1: number; x2: number; y2: number }[] = []
-      for (const edge of cdt.edges) {
-        if (!edge.isConstraint) continue
-        segs.push({ x1: cdt.pts[edge.v0]!.x, y1: cdt.pts[edge.v0]!.y, x2: cdt.pts[edge.v1]!.x, y2: cdt.pts[edge.v1]!.y })
-      }
-      constraintSegsPerLayer.set(z, segs)
-    }
-
+    // gEDA: oproute_rubberband() for each route after space_edge
     for (const cp of this.committedPaths) {
       const cdt = this.cdts[cp.layerZ]
       if (!cdt) continue
-      if (cp.vertices.length < 2) continue
+      if (cp.vertices.length < 3) continue // need at least start + edge + end
 
       const start = cp.vertices[0]!
       const end = cp.vertices[cp.vertices.length - 1]!
 
-      // Step 1: Rubber-band — create arcs around obstacle vertices
+      // Create arcs around obstacle vertices that violate clearance
       const arcs = rubberbandSegment(
         cdt,
         cp.vertices,
@@ -820,86 +836,29 @@ export class TopologicalPathSolver extends BaseSolver {
         this.minTraceWidth,
       )
 
-      // Step 2: Convert to geometric path (arcs + straight connections)
-      let smoothPath: Point[]
       if (arcs.length > 0) {
-        smoothPath = arcsToPath(
+        // Replace path with arc-based smooth path
+        const smoothPath = arcsToPath(
           { x: start.x, y: start.y },
           { x: end.x, y: end.y },
           arcs,
         )
-      } else {
-        // No arcs needed — keep original path for now
-        smoothPath = cp.vertices.map((v) => ({ x: v.x, y: v.y }))
+
+        cp.vertices = smoothPath.map((p, i) => {
+          if (i === 0) return cp.vertices[0]!
+          if (i === smoothPath.length - 1) return cp.vertices[cp.vertices.length - 1]!
+          return {
+            x: p.x, y: p.y,
+            edgeIdx: -1, t: -1,
+            isTemp: false, parent: null, child: null,
+            gcost: 0, hcost: 0,
+            routeName: cp.name, thickness: this.minTraceWidth,
+          } as RouteVertex
+        })
       }
-
-      // Note: path simplification (removing CDT-edge crossing points where
-      // prev→next doesn't cross constraints) is NOT done here. It causes
-      // traces to cut through obstacles because the constraint-intersection
-      // test has false negatives from floating point issues. The CDT-edge
-      // zigzag is the topologically correct path; gEDA smooths it with arcs.
-
-      // Step 4: Replace vertices
-      const newVertices = smoothPath.map((p, i) => {
-        if (i === 0) return cp.vertices[0]!
-        if (i === smoothPath.length - 1) return cp.vertices[cp.vertices.length - 1]!
-        return {
-          x: p.x, y: p.y,
-          edgeIdx: -1, t: -1,
-          isTemp: false, parent: null, child: null,
-          gcost: 0, hcost: 0,
-          routeName: cp.name, thickness: this.minTraceWidth,
-        } as RouteVertex
-      })
-
-      cp.vertices = newVertices
     }
 
     this.phase = "commit"
-  }
-
-  /**
-   * Iteratively remove points from a path where the straight line
-   * from prev→next doesn't cross any constraint edge.
-   */
-  private simplifyPointPath(
-    path: Point[],
-    constraintSegs: { x1: number; y1: number; x2: number; y2: number }[],
-  ): Point[] {
-    const result = [...path]
-    let changed = true
-    while (changed) {
-      changed = false
-      for (let i = 1; i < result.length - 1; i++) {
-        const prev = result[i - 1]!, next = result[i + 1]!
-        let crosses = false
-        for (const cs of constraintSegs) {
-          if (this.segsIntersect(prev.x, prev.y, next.x, next.y, cs.x1, cs.y1, cs.x2, cs.y2)) {
-            crosses = true
-            break
-          }
-        }
-        if (!crosses) {
-          result.splice(i, 1)
-          changed = true
-          break
-        }
-      }
-    }
-    return result
-  }
-
-  private segsIntersect(
-    a1x: number, a1y: number, a2x: number, a2y: number,
-    b1x: number, b1y: number, b2x: number, b2y: number,
-  ): boolean {
-    const d1x = a2x - a1x, d1y = a2y - a1y
-    const d2x = b2x - b1x, d2y = b2y - b1y
-    const denom = d1x * d2y - d1y * d2x
-    if (Math.abs(denom) < 1e-12) return false
-    const t = ((b1x - a1x) * d2y - (b1y - a1y) * d2x) / denom
-    const u = ((b1x - a1x) * d1y - (b1y - a1y) * d1x) / denom
-    return t > 0.01 && t < 0.99 && u > 0.01 && u < 0.99
   }
 
   private stepCommit() {
@@ -910,28 +869,27 @@ export class TopologicalPathSolver extends BaseSolver {
       const needStartVia = cp.startLayerZ !== cp.layerZ
       const needEndVia = cp.endLayerZ !== cp.layerZ
 
-      // Start bridge
+      // gEDA: the path includes terminal vertices at both ends.
+      // Bridges from originalStart/End are handled by the output solver
+      // which knows the connection endpoints. We just emit the route
+      // with vias where layer transitions occur.
+
       if (needStartVia) {
+        // Start on native layer, via to route layer
         fullRoute.push({ x: cp.originalStart.x, y: cp.originalStart.y, z: cp.startLayerZ })
-        fullRoute.push({ x: cp.vertices[0]!.x, y: cp.vertices[0]!.y, z: cp.startLayerZ })
         vias.push({ x: cp.vertices[0]!.x, y: cp.vertices[0]!.y })
-      } else {
-        fullRoute.push({ x: cp.originalStart.x, y: cp.originalStart.y, z: cp.layerZ })
       }
 
-      // Main route
+      // Main route on route layer
       for (const rv of cp.vertices) {
         fullRoute.push({ x: rv.x, y: rv.y, z: cp.layerZ })
       }
 
-      // End bridge
       if (needEndVia) {
+        // Via to end native layer
         const last = cp.vertices[cp.vertices.length - 1]!
         vias.push({ x: last.x, y: last.y })
-        fullRoute.push({ x: last.x, y: last.y, z: cp.endLayerZ })
         fullRoute.push({ x: cp.originalEnd.x, y: cp.originalEnd.y, z: cp.endLayerZ })
-      } else {
-        fullRoute.push({ x: cp.originalEnd.x, y: cp.originalEnd.y, z: cp.layerZ })
       }
 
       return { connectionName: cp.name, route: fullRoute, vias }
