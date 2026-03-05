@@ -37,6 +37,7 @@ import {
 import { AssignableAutoroutingPipeline2 } from "lib/autorouter-pipelines/AssignableAutoroutingPipeline2/AssignableAutoroutingPipeline2"
 import { AssignableAutoroutingPipeline3 } from "lib/autorouter-pipelines/AssignableAutoroutingPipeline3/AssignableAutoroutingPipeline3"
 import { GreedySequentialPipelineSolver } from "lib/autorouter-pipelines/GreedySequentialPipeline/GreedySequentialPipelineSolver"
+import { TopologicalPipelineSolver } from "lib/autorouter-pipelines/TopologicalPipeline/TopologicalPipelineSolver"
 
 const PIPELINE_SOLVERS = {
   AutoroutingPipelineSolver2_PortPointPathing,
@@ -46,6 +47,7 @@ const PIPELINE_SOLVERS = {
   AssignableAutoroutingPipeline3,
   AutoroutingPipeline1_OriginalUnravel,
   GreedySequentialPipelineSolver,
+  TopologicalPipelineSolver,
 } as const
 
 const PIPELINE_STORAGE_KEY = "selectedPipeline"

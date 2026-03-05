@@ -55,6 +55,10 @@ export const PIPELINE_OPTIONS = [
     id: "GreedySequentialPipelineSolver",
     label: "Greedy Sequential Pipeline",
   },
+  {
+    id: "TopologicalPipelineSolver",
+    label: "Topological Rubberband Pipeline",
+  },
 ] as const
 
 export type PipelineId = (typeof PIPELINE_OPTIONS)[number]["id"]
