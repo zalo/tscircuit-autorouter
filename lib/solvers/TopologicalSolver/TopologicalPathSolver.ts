@@ -364,6 +364,14 @@ export class TopologicalPathSolver extends BaseSolver {
   ): RouteVertex[] {
     const tri = cdt.triangles[triIdx]!
     const curEdge = cdt.edges[curEdgeIdx]!
+
+    // gEDA check_triangle_interior_capacity: verify triangle has room
+    {
+      const capOppIdx = tri.v.find((vi) => vi !== curEdge.v0 && vi !== curEdge.v1)
+      if (capOppIdx !== undefined && !this.checkTriangleCapacity(cdt, layerZ, triIdx, capOppIdx)) {
+        return [] // Triangle is full
+      }
+    }
     const candidates: RouteVertex[] = []
 
     // Find opposite vertex (op_v)
@@ -409,7 +417,51 @@ export class TopologicalPathSolver extends BaseSolver {
   }
 
   /**
-   * Check if a route vertex has parent/child connecting to a specific CDT vertex.
+   * Port of gEDA check_triangle_interior_capacity():
+   * Check if a triangle has room for another route to pass through.
+   */
+  private checkTriangleCapacity(
+    cdt: RawCdt, layerZ: number, triIdx: number, entryVi: number,
+  ): boolean {
+    const tri = cdt.triangles[triIdx]!
+    // Find opposite edge from entryVi
+    let opV0 = -1, opV1 = -1
+    for (let slot = 0; slot < 3; slot++) {
+      const va = tri.v[slot]!, vb = tri.v[(slot + 1) % 3]!
+      if (va === entryVi || vb === entryVi) continue
+      opV0 = va; opV1 = vb; break
+    }
+    if (opV0 < 0) return true
+    const opEi = cdt.edgeMap.get(this.edgeKey(opV0, opV1))
+    if (opEi === undefined) return true
+    const opEdge = cdt.edges[opEi]!
+
+    // Capacity = perpendicular distance from entryVi to op_e
+    const ev = cdt.pts[entryVi]!
+    const ep0 = cdt.pts[opEdge.v0]!, ep1 = cdt.pts[opEdge.v1]!
+    const edx = ep1.x - ep0.x, edy = ep1.y - ep0.y
+    const elen = Math.hypot(edx, edy)
+    if (elen < 1e-9) return true
+    const capacity = Math.abs((ev.x - ep0.x) * edy - (ev.y - ep0.y) * edx) / elen
+
+    // Flow = spacing consumed by routes crossing this triangle
+    const e1Idx = cdt.edgeMap.get(this.edgeKey(entryVi, opV0))
+    const e2Idx = cdt.edgeMap.get(this.edgeKey(entryVi, opV1))
+    const ms = this.minTraceWidth + this.margin
+    let flow = 0
+    if (e1Idx !== undefined) {
+      for (const rv of this.getEdgeRouting(layerZ, e1Idx)) {
+        if (rv.isTemp) continue
+        if ((rv.parent?.edgeIdx === e2Idx || rv.parent?.edgeIdx === opEi) ||
+            (rv.child?.edgeIdx === e2Idx || rv.child?.edgeIdx === opEi)) {
+          flow += ms
+        }
+      }
+    }
+    return flow < capacity
+  }
+
+  /** Check if a route vertex has parent/child connecting to a specific CDT vertex.
    */
   private vertexConnectsTo(rv: RouteVertex | null, cdtVi: number): boolean {
     if (!rv) return false
@@ -496,6 +548,9 @@ export class TopologicalPathSolver extends BaseSolver {
     destCdtVi: number,
   ): RouteVertex[] {
     const tri = cdt.triangles[triIdx]!
+
+    // Check triangle capacity
+    if (!this.checkTriangleCapacity(cdt, layerZ, triIdx, curVi)) return []
 
     // Find op_e (opposite edge — the edge not touching curVi)
     let opEdgeIdx = -1

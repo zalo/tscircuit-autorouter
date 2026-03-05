@@ -3,10 +3,7 @@
 ## Tracing (High Priority)
 - [x] `triangle_candidate_points_from_edge()` — parent/child gap tracing (ported)
 - [x] `edge_adjacent_vertices()` — find adjacent committed vertices (ported)
-- [ ] `triangle_candidate_points_from_vertex()` — full version with e1/e2 tracing
-  - Currently: generates candidates on opposite edge without checking adjacent edges
-  - gEDA: checks routing on e1/e2 to find vv1/vv2 gap boundaries on op_e
-  - Impact: better gap finding when expanding from CDT vertices
+- [x] `triangle_candidate_points_from_vertex()` — e1/e2 gap tracing (ported)
 - [ ] `edge_flow()` with proper per-vertex thickness/keepaway
   - Currently: uniform spacing (minTraceWidth + margin)
   - gEDA: min_spacing(v1, dest) uses actual net thickness and keepaway per vertex
