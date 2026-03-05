@@ -1,21 +1,17 @@
 # Topological Router Port — Remaining Work
 
 ## Tracing (High Priority)
-- [ ] `triangle_candidate_points_from_edge()` — full parent/child gap tracing
-  - Currently: simplified gap-finder looks at edge routing list directly
-  - gEDA: traces parent/child links on adjacent edges e1/e2 to find where
-    existing routes cross the opposite edge, determining correct gap boundaries
-  - Impact: prevents two routes from using the same corridor without spacing
+- [x] `triangle_candidate_points_from_edge()` — parent/child gap tracing (ported)
+- [x] `edge_adjacent_vertices()` — find adjacent committed vertices (ported)
 - [ ] `triangle_candidate_points_from_vertex()` — full version with e1/e2 tracing
   - Currently: generates candidates on opposite edge without checking adjacent edges
   - gEDA: checks routing on e1/e2 to find vv1/vv2 gap boundaries on op_e
-  - Impact: better gap finding when routes cross adjacent triangles
-- [ ] `edge_adjacent_vertices()` — find the route vertices adjacent to a given
-  vertex on an edge (prev/next in the routing list that are non-temp)
-  - Used by both triangle_candidate_points functions
+  - Impact: better gap finding when expanding from CDT vertices
 - [ ] `edge_flow()` with proper per-vertex thickness/keepaway
   - Currently: uniform spacing (minTraceWidth + margin)
   - gEDA: min_spacing(v1, dest) uses actual net thickness and keepaway per vertex
+- [ ] `check_triangle_interior_capacity()` — verify triangle has room for route
+  - gEDA checks perpendicular distance from vertex to opposite edge vs flow
 
 ## Net Ordering (Medium Priority)
 - [ ] `netscore_create()` — route each net in isolation, record score

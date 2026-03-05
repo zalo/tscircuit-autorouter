@@ -480,6 +480,128 @@ export class TopologicalPathSolver extends BaseSolver {
     return this.candidateVerticesOnEdge(cdt, layerZ, targetEdgeIdx, dest.thickness)
   }
 
+  /**
+   * Port of gEDA triangle_candidate_points_from_vertex():
+   * When expanding from CDT vertex `curVi` in triangle `triIdx`,
+   * find the opposite edge (op_e), trace routing on side edges (e1, e2)
+   * to find gap boundaries (vv1, vv2) on op_e, then generate candidates
+   * in gaps between existing routes.
+   */
+  private triangleCandidatePointsFromVertex(
+    cdt: RawCdt,
+    layerZ: number,
+    triIdx: number,
+    curVi: number,
+    dest: RouteVertex,
+    destCdtVi: number,
+  ): RouteVertex[] {
+    const tri = cdt.triangles[triIdx]!
+
+    // Find op_e (opposite edge — the edge not touching curVi)
+    let opEdgeIdx = -1
+    let opV0 = -1, opV1 = -1
+    for (let slot = 0; slot < 3; slot++) {
+      const va = tri.v[slot]!, vb = tri.v[(slot + 1) % 3]!
+      if (va === curVi || vb === curVi) continue
+      opV0 = va; opV1 = vb
+      const ek = this.edgeKey(va, vb)
+      opEdgeIdx = cdt.edgeMap.get(ek) ?? -1
+      break
+    }
+    if (opEdgeIdx < 0) return []
+
+    const opEdge = cdt.edges[opEdgeIdx]!
+    if (opEdge.isConstraint) return []
+
+    // Check if dest is on op_e
+    if (opV0 === destCdtVi || opV1 === destCdtVi) return [dest]
+
+    // e1: edge from curVi to opV0, e2: edge from curVi to opV1
+    const e1Idx = cdt.edgeMap.get(this.edgeKey(curVi, opV0)) ?? -1
+    const e2Idx = cdt.edgeMap.get(this.edgeKey(curVi, opV1)) ?? -1
+
+    // Trace e1 to find vv1 (gap start on op_e)
+    let vv1T = opEdge.v0 === opV0 ? 0 : 1 // default: op_e endpoint toward opV0
+    if (e1Idx >= 0) {
+      const e1routing = this.getEdgeRouting(layerZ, e1Idx)
+      // Find the committed route vertex on e1 nearest to curVi
+      const e1edge = cdt.edges[e1Idx]!
+      const nearCurEnd = e1edge.v0 === curVi ? 0 : 1
+
+      // Get the first/last committed vertex depending on which end is curVi
+      let tracedV: RouteVertex | null = null
+      if (nearCurEnd === 0 && e1routing.length > 0) tracedV = e1routing[0]!
+      else if (nearCurEnd === 1 && e1routing.length > 0) tracedV = e1routing[e1routing.length - 1]!
+
+      if (tracedV) {
+        // Does tracedV's parent/child cross op_e?
+        if (tracedV.parent && tracedV.parent.edgeIdx === opEdgeIdx) {
+          vv1T = tracedV.parent.t
+        } else if (tracedV.child && tracedV.child.edgeIdx === opEdgeIdx) {
+          vv1T = tracedV.child.t
+        }
+        // If tracedV connects to the OTHER op_e endpoint, the triangle is blocked
+        if (tracedV.parent && this.isVertexAtCdtVertex(tracedV.parent, opV1, cdt)) return []
+        if (tracedV.child && this.isVertexAtCdtVertex(tracedV.child, opV1, cdt)) return []
+      }
+    }
+
+    // Trace e2 to find vv2 (gap end on op_e)
+    let vv2T = opEdge.v0 === opV1 ? 0 : 1 // default: op_e endpoint toward opV1
+    if (e2Idx >= 0) {
+      const e2routing = this.getEdgeRouting(layerZ, e2Idx)
+      const e2edge = cdt.edges[e2Idx]!
+      const nearCurEnd = e2edge.v0 === curVi ? 0 : 1
+
+      let tracedV: RouteVertex | null = null
+      if (nearCurEnd === 0 && e2routing.length > 0) tracedV = e2routing[0]!
+      else if (nearCurEnd === 1 && e2routing.length > 0) tracedV = e2routing[e2routing.length - 1]!
+
+      if (tracedV) {
+        if (tracedV.parent && tracedV.parent.edgeIdx === opEdgeIdx) {
+          vv2T = tracedV.parent.t
+        } else if (tracedV.child && tracedV.child.edgeIdx === opEdgeIdx) {
+          vv2T = tracedV.child.t
+        }
+        if (tracedV.parent && this.isVertexAtCdtVertex(tracedV.parent, opV0, cdt)) return []
+        if (tracedV.child && this.isVertexAtCdtVertex(tracedV.child, opV0, cdt)) return []
+      }
+    }
+
+    // Generate candidates between vv1T and vv2T on op_e,
+    // splitting at existing route vertices that connect to curVi
+    const opRouting = this.getEdgeRouting(layerZ, opEdgeIdx)
+    const results: RouteVertex[] = []
+
+    // Ensure vv1T < vv2T
+    const tLow = Math.min(vv1T, vv2T)
+    const tHigh = Math.max(vv1T, vv2T)
+
+    let gapStart = tLow
+    for (const rv of opRouting) {
+      if (rv.t < tLow || rv.t > tHigh) continue
+      // Does this route vertex connect back to curVi?
+      const connectsToCur =
+        (rv.parent && this.isVertexAtCdtVertex(rv.parent, curVi, cdt)) ||
+        (rv.child && this.isVertexAtCdtVertex(rv.child, curVi, cdt))
+      if (connectsToCur) {
+        // Generate candidates in gap [gapStart, rv.t]
+        results.push(...this.candidateVertices(cdt, layerZ, opEdgeIdx, gapStart, rv.t, dest.thickness))
+        gapStart = rv.t
+      }
+    }
+    // Final gap [gapStart, tHigh]
+    results.push(...this.candidateVertices(cdt, layerZ, opEdgeIdx, gapStart, tHigh, dest.thickness))
+
+    return results
+  }
+
+  /** Check if a route vertex is at (or near) a specific CDT vertex position */
+  private isVertexAtCdtVertex(rv: RouteVertex, cdtVi: number, cdt: RawCdt): boolean {
+    const p = cdt.pts[cdtVi]!
+    return Math.abs(rv.x - p.x) < 0.01 && Math.abs(rv.y - p.y) < 0.01
+  }
+
   // ===== CANDIDATE VERTEX GENERATION (gEDA candidate_vertices) =====
 
   /**
@@ -743,38 +865,19 @@ export class TopologicalPathSolver extends BaseSolver {
         }
       }
 
-      // Explore all adjacent triangles (gEDA: gts_vertex_triangles)
-      // For each triangle, generate candidates on the OPPOSITE edge only
-      // (gEDA triangle_candidate_points_from_vertex)
+      // gEDA triangle_candidate_points_from_vertex:
+      // For each adjacent triangle, find the opposite edge (op_e),
+      // trace routing on the two side edges (e1, e2) to find gap
+      // boundaries (vv1, vv2) on op_e, then generate candidates in gaps.
       const tris = cdt.vertexTriangles[curCdtVi] ?? this.findTrianglesContainingPoint(cdt, cur)
       for (const ti of tris) {
         const tri = cdt.triangles[ti]!
         if (tri.obstacle) continue
 
-        // Find the opposite edge (the one edge that doesn't contain curCdtVi)
-        for (let slot = 0; slot < 3; slot++) {
-          const va = tri.v[slot]!, vb = tri.v[(slot + 1) % 3]!
-          if (va === curCdtVi || vb === curCdtVi) continue
-
-          // This is the opposite edge
-          const ek = this.edgeKey(va, vb)
-          const ei = cdt.edgeMap.get(ek)
-          if (ei === undefined) continue
-          const edge = cdt.edges[ei]!
-
-          // gEDA: constraint edges of different nets are impassable
-          if (edge.isConstraint) continue
-
-          // Check if dest vertex is on this edge
-          if (va === destCdtVi || vb === destCdtVi) {
-            candidates.push(dest)
-            continue
-          }
-
-          const cands = this.candidateVerticesOnEdge(cdt, layerZ, ei, dest.thickness)
-          candidates.push(...cands)
-          break // Only one opposite edge per triangle
-        }
+        const cands = this.triangleCandidatePointsFromVertex(
+          cdt, layerZ, ti, curCdtVi, dest, destCdtVi,
+        )
+        candidates.push(...cands)
       }
     } else {
       // Temp vertex on edge — winding check (gEDA prevwind)
