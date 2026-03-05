@@ -80,6 +80,8 @@ export class TopologicalPathSolver extends BaseSolver {
   private phase: "build-cdt" | "order" | "route" | "roar" | "space" | "rubberband" | "commit" | "done" = "build-cdt"
   private failedConnections: (typeof this.connections)[0][] = []
   private roarPassCount = 0
+  /** When true, segment overlap check is disabled (gEDA TOPOROUTER_FLAG_LEASTINVALID) */
+  private leastInvalidMode = false
   /** Per-connection isolated routing score (for net ordering) */
   private connectionScores = new Map<string, number>()
   private routeIndex = 0
@@ -871,6 +873,7 @@ export class TopologicalPathSolver extends BaseSolver {
     b: Point,
     connectionName: string,
   ): boolean {
+    if (this.leastInvalidMode) return false
     const minDist = this.minTraceWidth
     const baseNet = TopologicalPathSolver.baseNetName(connectionName)
 
@@ -1205,21 +1208,160 @@ export class TopologicalPathSolver extends BaseSolver {
   // ===== ROAR: Rip-up and Reroute (gEDA roar_router) =====
 
   /**
-   * After initial routing, try to route failed connections by ripping up
-   * conflicting routes and re-routing them.
+   * Find committed routes whose path segments are too close to a given path.
+   * Port of gEDA vertices_routing_conflicts / route_conflicts.
    */
-  private roarPass(failedConns: (typeof this.connections)[0][], threshold: number): (typeof this.connections)[0][] {
+  private findConflictingRoutes(
+    layerZ: number,
+    path: RouteVertex[],
+    connectionName: string,
+  ): number[] {
+    const baseNet = TopologicalPathSolver.baseNetName(connectionName)
+    const conflictIdxs: number[] = []
+    const minDist = this.minTraceWidth
+
+    for (let cpIdx = 0; cpIdx < this.committedPaths.length; cpIdx++) {
+      const cp = this.committedPaths[cpIdx]!
+      if (cp.layerZ !== layerZ) continue
+      if (TopologicalPathSolver.baseNetName(cp.name) === baseNet) continue
+
+      // Check if any segment of cp overlaps with any segment of path
+      let conflicts = false
+      for (let i = 0; i < path.length - 1 && !conflicts; i++) {
+        for (let j = 0; j < cp.vertices.length - 1; j++) {
+          const d = this.segSegMinDist(
+            path[i]!.x, path[i]!.y, path[i+1]!.x, path[i+1]!.y,
+            cp.vertices[j]!.x, cp.vertices[j]!.y, cp.vertices[j+1]!.x, cp.vertices[j+1]!.y,
+          )
+          if (d < minDist) { conflicts = true; break }
+        }
+      }
+      if (conflicts) conflictIdxs.push(cpIdx)
+    }
+    return conflictIdxs
+  }
+
+  /**
+   * Port of gEDA roar_route(): try to route a failed connection by
+   * temporarily allowing overlap, detecting conflicts, ripping up
+   * conflicting routes, and re-routing them. Rollback if total score worsens.
+   */
+  private roarRoute(conn: (typeof this.connections)[0]): boolean {
+    // First, try normal routing (might work if previous routes were removed)
+    if (this.tryRouteConnection(conn)) return true
+
+    // Try routing with segment overlap check disabled (LEASTINVALID equivalent)
+    this.leastInvalidMode = true
+
+    let routedPath: RouteVertex[] | null = null
+    let routedLayer = -1
+    for (const lz of [conn.startLayerZ, conn.startLayerZ === 0 ? 1 : 0]) {
+      if (lz >= this.layerCount) continue
+      const cdt = this.cdts[lz]
+      if (!cdt) continue
+      routedPath = this.routeConnection(cdt, lz, conn)
+      if (routedPath) { routedLayer = lz; break }
+    }
+
+    this.leastInvalidMode = false
+
+    if (!routedPath || routedLayer < 0) return false
+
+    // Calculate new route score
+    let newScore = 0
+    for (let i = 1; i < routedPath.length; i++) {
+      newScore += distance(routedPath[i-1]!, routedPath[i]!)
+    }
+
+    // Find conflicting routes
+    const conflicts = this.findConflictingRoutes(routedLayer, routedPath, conn.name)
+    if (conflicts.length === 0) {
+      // No conflicts — just commit
+      this.applyRoute(conn, routedPath, routedLayer)
+      return true
+    }
+
+    // Save current state for rollback
+    const savedPaths: Array<{
+      conn: { name: string; originalStart: Point; originalEnd: Point; start: Point; end: Point; startLayerZ: number; endLayerZ: number }
+      vertices: RouteVertex[]
+      layerZ: number
+    }> = []
+    let prevTotalScore = 0
+
+    // Calculate total score of conflicting routes
+    for (const cpIdx of conflicts) {
+      const cp = this.committedPaths[cpIdx]!
+      let score = 0
+      for (let i = 1; i < cp.vertices.length; i++) {
+        score += distance(cp.vertices[i-1]!, cp.vertices[i]!)
+      }
+      prevTotalScore += score
+      const matchConn = this.connections.find(c => c.name === cp.name)
+      if (matchConn) {
+        savedPaths.push({ conn: matchConn, vertices: [...cp.vertices], layerZ: cp.layerZ })
+      }
+    }
+
+    // Remove conflicting routes (highest index first to preserve indices)
+    const sortedConflicts = [...conflicts].sort((a, b) => b - a)
+    for (const cpIdx of sortedConflicts) {
+      this.removeRoute(cpIdx)
+    }
+
+    // Commit new route
+    this.applyRoute(conn, routedPath, routedLayer)
+
+    // Try re-routing conflicting routes
+    let newTotalScore = newScore
+    const reRoutedConns: string[] = []
+    let allReRouted = true
+
+    for (const saved of savedPaths) {
+      if (this.tryRouteConnection(saved.conn)) {
+        const rerouted = this.committedPaths.find(cp => cp.name === saved.conn.name)
+        if (rerouted) {
+          let score = 0
+          for (let i = 1; i < rerouted.vertices.length; i++) {
+            score += distance(rerouted.vertices[i-1]!, rerouted.vertices[i]!)
+          }
+          newTotalScore += score
+          reRoutedConns.push(saved.conn.name)
+        }
+      } else {
+        allReRouted = false
+        break
+      }
+    }
+
+    // Check if total score improved
+    if (!allReRouted || newTotalScore > prevTotalScore * 1.5) {
+      // Rollback: remove new route and re-routed routes
+      // Remove in reverse order
+      for (const name of [...reRoutedConns, conn.name]) {
+        const idx = this.committedPaths.findIndex(cp => cp.name === name)
+        if (idx >= 0) this.removeRoute(idx)
+      }
+      // Restore original routes
+      for (const saved of savedPaths) {
+        this.applyRoute(saved.conn, saved.vertices, saved.layerZ)
+      }
+      return false
+    }
+
+    return true
+  }
+
+  /**
+   * Port of gEDA roar_router: run multiple ROAR passes.
+   */
+  private roarPass(failedConns: (typeof this.connections)[0][]): (typeof this.connections)[0][] {
     const stillFailed: (typeof this.connections)[0][] = []
 
     for (const conn of failedConns) {
-      // Try routing with overlap check relaxed (allow closer approach)
-      const saved = this.minTraceWidth
-      // Temporarily allow tighter spacing for conflict detection
-      const routed = this.tryRouteConnection(conn)
-      if (routed) continue
-
-      // If can't route even with relaxed spacing, still failed
-      stillFailed.push(conn)
+      if (!this.roarRoute(conn)) {
+        stillFailed.push(conn)
+      }
     }
 
     return stillFailed
@@ -1431,7 +1573,7 @@ export class TopologicalPathSolver extends BaseSolver {
     }
 
     const prevFailed = this.failedConnections.length
-    this.failedConnections = this.roarPass(this.failedConnections, this.roarPassCount % 2 === 0 ? 2 : 5)
+    this.failedConnections = this.roarPass(this.failedConnections)
     this.roarPassCount++
 
     // If no improvement, stop
