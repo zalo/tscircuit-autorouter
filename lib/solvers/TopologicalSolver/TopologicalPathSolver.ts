@@ -12,33 +12,26 @@ import {
   buildRawCdt,
   type RawCdt,
   type CdtEdge,
-  type CdtTriangle,
 } from "./TopologicalCdt"
+import {
+  type RouteVertex,
+  createTempVertex,
+  createFixedVertex,
+  minSpacing,
+} from "./TopoRouteVertex"
 
 /**
- * Topological Rubberband Autorouter (gEDA-style)
+ * Topological Rubberband Autorouter — direct port of gEDA toporouter.c
  *
- * Based on the gEDA toporouter by Anthony Blake (2009), implementing
- * the SURF topological routing approach:
+ * Key principle: route vertices live ON CDT edges. The edge's routing
+ * list (sorted by t-parameter) IS the topological state. Route paths
+ * are linked lists of vertices via parent/child pointers.
  *
- * 1. BUILD CDT: Constrained Delaunay Triangulation from SRJ obstacles.
- *    The CDT is built ONCE per layer and never rebuilt.
- *
- * 2. ROUTE VIA A* THROUGH CDT EDGES: Each route is an A* search through
- *    CDT triangles. Candidate waypoints are placed ON CDT edges (not in
- *    free space). Each edge stores an ordered list of route crossings.
- *    The crossing order defines the topological embedding.
- *
- * 3. EDGE CAPACITY: Each CDT edge has a capacity (its geometric length)
- *    and flow (space consumed by existing route crossings). New routes
- *    can only cross edges with remaining capacity.
- *
- * 4. RUBBER-BANDING: After all routes are embedded, each path is pulled
- *    tight by computing tangent arcs around obstacle vertices while
- *    preserving the crossing order on shared edges.
- *
- * 5. SPACING: Route vertices on shared edges are spread via force-based
- *    relaxation to maintain minimum clearances.
+ * Algorithm phases:
+ * 1. Build CDT from obstacles (once per layer)
+ * 2. A* route each connection through CDT triangles, placing vertices on edges
+ * 3. space_edge(): force-based relaxation to spread vertices on shared edges
+ * 4. Commit paths to output format
  */
 export class TopologicalPathSolver extends BaseSolver {
   override getSolverName(): string {
@@ -53,13 +46,14 @@ export class TopologicalPathSolver extends BaseSolver {
   private maxLayerCount: number
   private layerCount: number
 
-  /** Per-layer raw CDTs (built once, never rebuilt) */
+  /** Per-layer raw CDTs */
   private cdts: (RawCdt | null)[] = []
-
   /** Per-layer base obstacle polygons */
   private baseObstaclePolygons: Point[][][] = []
+  /** Per-layer edge routing lists: edgeIdx → sorted list of RouteVertex */
+  private edgeRoutingLists: Map<number, RouteVertex[]>[] = []
 
-  /** All connections to route */
+  /** Connections to route */
   private connections: Array<{
     name: string
     originalStart: Point
@@ -70,26 +64,22 @@ export class TopologicalPathSolver extends BaseSolver {
     endLayerZ: number
   }> = []
 
-  /** Routed paths */
-  private routes: TopoRouteState[] = []
+  /** Committed route paths (ordered vertex lists) */
+  private committedPaths: Array<{
+    name: string
+    vertices: RouteVertex[]
+    layerZ: number
+    originalStart: Point
+    originalEnd: Point
+    startLayerZ: number
+    endLayerZ: number
+  }> = []
 
-  /** Final output */
   private resolvedPaths: ResolvedPath[] = []
-
-  /** Solver phase */
-  private phase:
-    | "build-cdt"
-    | "route"
-    | "rubberband"
-    | "commit"
-    | "done" = "build-cdt"
+  private phase: "build-cdt" | "route" | "space" | "commit" | "done" = "build-cdt"
   private routeIndex = 0
-  private rubberBandIter = 0
-
-  /** Layer name → z-index */
   private layerNameToZ = new Map<string, number>()
 
-  /** Validation result */
   validationResult: {
     totalConnections: number
     routedConnections: number
@@ -107,8 +97,7 @@ export class TopologicalPathSolver extends BaseSolver {
     this.MAX_ITERATIONS = 100_000_000
     this.srj = params.srj
     this.minTraceWidth = params.minTraceWidth ?? params.srj.minTraceWidth
-    this.margin =
-      params.margin ?? params.srj.defaultObstacleMargin ?? this.minTraceWidth
+    this.margin = params.margin ?? params.srj.defaultObstacleMargin ?? this.minTraceWidth
     this.viaDiameter = params.srj.minViaDiameter ?? 0.6
     this.maxLayerCount = Math.max(1, params.srj.layerCount ?? 2)
     this.layerCount = this.maxLayerCount
@@ -116,100 +105,64 @@ export class TopologicalPathSolver extends BaseSolver {
     const connMap = getConnectivityMapFromSimpleRouteJson(params.srj)
     this.colorMap = params.colorMap ?? getColorMap(params.srj, connMap)
 
-    // Layer name → z-index
     const allLayerNames = this.getAllLayerNames()
     for (let z = 0; z < allLayerNames.length; z++) {
       this.layerNameToZ.set(allLayerNames[z]!, z)
     }
 
-    // Base obstacle polygons per layer
     this.baseObstaclePolygons = []
     for (let z = 0; z < this.maxLayerCount; z++) {
       const layerName = allLayerNames[z]!
-      const layerPolys: Point[][] = []
+      const polys: Point[][] = []
       for (const obs of params.srj.obstacles) {
         if (!obs.layers.includes(layerName)) continue
-        layerPolys.push(
-          rectToPolygon(
-            obs.center.x,
-            obs.center.y,
-            obs.width,
-            obs.height,
-            this.margin,
-          ),
-        )
+        polys.push(rectToPolygon(obs.center.x, obs.center.y, obs.width, obs.height, this.margin))
       }
-      this.baseObstaclePolygons.push(layerPolys)
+      this.baseObstaclePolygons.push(polys)
     }
 
     // Build connections with nudged endpoints
     this.connections = params.srj.connections.map((conn) => {
       const pts = conn.pointsToConnect
       const originalStart = { x: pts[0]!.x, y: pts[0]!.y }
-      const originalEnd = {
-        x: pts[pts.length - 1]!.x,
-        y: pts[pts.length - 1]!.y,
-      }
+      const originalEnd = { x: pts[pts.length - 1]!.x, y: pts[pts.length - 1]!.y }
 
       const connNames = [conn.name]
-      if (conn.rootConnectionName && conn.rootConnectionName !== conn.name) {
+      if (conn.rootConnectionName && conn.rootConnectionName !== conn.name)
         connNames.push(conn.rootConnectionName)
-      }
-      if (conn.name.includes("__")) {
-        for (const part of conn.name.split("__")) {
+      if (conn.name.includes("__"))
+        for (const part of conn.name.split("__"))
           if (!connNames.includes(part)) connNames.push(part)
-        }
-      }
-
-      const nudgedStart = this.nudgeOutOfObstacle(
-        originalStart,
-        originalEnd,
-        params.srj.obstacles,
-        connNames,
-      )
-      const nudgedEnd = this.nudgeOutOfObstacle(
-        originalEnd,
-        originalStart,
-        params.srj.obstacles,
-        connNames,
-      )
 
       return {
         name: conn.name,
         originalStart,
         originalEnd,
-        start: nudgedStart,
-        end: nudgedEnd,
+        start: this.nudgeOutOfObstacle(originalStart, originalEnd, params.srj.obstacles, connNames),
+        end: this.nudgeOutOfObstacle(originalEnd, originalStart, params.srj.obstacles, connNames),
         startLayerZ: this.connectionPointToLayerZ(pts[0]!),
         endLayerZ: this.connectionPointToLayerZ(pts[pts.length - 1]!),
       }
     })
 
-    // Sort: shortest first
-    this.connections.sort(
-      (a, b) => distance(a.start, a.end) - distance(b.start, b.end),
-    )
+    // Sort shortest first
+    this.connections.sort((a, b) => distance(a.start, a.end) - distance(b.start, b.end))
   }
 
+  // ===== UTILITIES =====
+
   private getAllLayerNames(): string[] {
-    const layerSet = new Set<string>()
-    for (const obs of this.srj.obstacles) {
-      for (const l of obs.layers) layerSet.add(l)
-    }
-    for (const conn of this.srj.connections) {
+    const s = new Set<string>()
+    for (const obs of this.srj.obstacles) for (const l of obs.layers) s.add(l)
+    for (const conn of this.srj.connections)
       for (const pt of conn.pointsToConnect) {
-        if ("layer" in pt) layerSet.add(pt.layer)
-        if ("layers" in pt) {
-          for (const l of pt.layers) layerSet.add(l)
-        }
+        if ("layer" in pt) s.add(pt.layer)
+        if ("layers" in pt) for (const l of pt.layers) s.add(l)
       }
-    }
-    const layers = Array.from(layerSet)
+    const layers = Array.from(s)
     layers.sort((a, b) => {
-      if (a === "top") return -1
-      if (b === "top") return 1
-      if (a === "bottom") return 1
-      if (b === "bottom") return -1
+      if (a === "top") return -1; if (b === "top") return 1
+      if (a === "bottom") return 1; if (b === "bottom") return -1
       return a.localeCompare(b)
     })
     return layers.length > 0 ? layers : ["top", "bottom"]
@@ -217,81 +170,45 @@ export class TopologicalPathSolver extends BaseSolver {
 
   private connectionPointToLayerZ(pt: ConnectionPoint): number {
     const layers = getConnectionPointLayers(pt)
-    for (const name of layers) {
-      const z = this.layerNameToZ.get(name)
-      if (z !== undefined) return z
-    }
+    for (const name of layers) { const z = this.layerNameToZ.get(name); if (z !== undefined) return z }
     return 0
   }
 
-  private nudgeOutOfObstacle(
-    pt: Point,
-    other: Point,
-    obstacles: SimpleRouteJson["obstacles"],
-    connNames: string[],
-  ): Point {
-    const connected = obstacles.filter((obs) =>
-      connNames.some((n) => obs.connectedTo.includes(n)),
-    )
+  private nudgeOutOfObstacle(pt: Point, other: Point, obstacles: SimpleRouteJson["obstacles"], connNames: string[]): Point {
+    const connected = obstacles.filter((obs) => connNames.some((n) => obs.connectedTo.includes(n)))
     if (connected.length === 0) return pt
-
     let containingObs: (typeof connected)[0] | null = null
     for (const obs of connected) {
-      const halfW = obs.width / 2 + this.margin + 0.05
-      const halfH = obs.height / 2 + this.margin + 0.05
-      if (
-        Math.abs(pt.x - obs.center.x) < halfW &&
-        Math.abs(pt.y - obs.center.y) < halfH
-      ) {
-        if (
-          !containingObs ||
-          obs.width * obs.height < containingObs.width * containingObs.height
-        ) {
-          containingObs = obs
-        }
+      const hw = obs.width / 2 + this.margin + 0.05, hh = obs.height / 2 + this.margin + 0.05
+      if (Math.abs(pt.x - obs.center.x) < hw && Math.abs(pt.y - obs.center.y) < hh) {
+        if (!containingObs || obs.width * obs.height < containingObs.width * containingObs.height) containingObs = obs
       }
     }
     if (!containingObs) return pt
-
     const obs = containingObs
-    const halfW = obs.width / 2 + this.margin + 0.05
-    const halfH = obs.height / 2 + this.margin + 0.05
-    const toOtherX = other.x - pt.x
-    const toOtherY = other.y - pt.y
-    const dx = pt.x - obs.center.x
-    const dy = pt.y - obs.center.y
-
-    const candidates = [
-      { x: obs.center.x + halfW, y: pt.y, score: toOtherX, dist: halfW - dx },
-      { x: obs.center.x - halfW, y: pt.y, score: -toOtherX, dist: halfW + dx },
-      { x: pt.x, y: obs.center.y + halfH, score: toOtherY, dist: halfH - dy },
-      { x: pt.x, y: obs.center.y - halfH, score: -toOtherY, dist: halfH + dy },
+    const hw = obs.width / 2 + this.margin + 0.05, hh = obs.height / 2 + this.margin + 0.05
+    const toX = other.x - pt.x, toY = other.y - pt.y
+    const dx = pt.x - obs.center.x, dy = pt.y - obs.center.y
+    const cands = [
+      { x: obs.center.x + hw, y: pt.y, score: toX, dist: hw - dx },
+      { x: obs.center.x - hw, y: pt.y, score: -toX, dist: hw + dx },
+      { x: pt.x, y: obs.center.y + hh, score: toY, dist: hh - dy },
+      { x: pt.x, y: obs.center.y - hh, score: -toY, dist: hh + dy },
     ]
-    candidates.sort((a, b) => {
-      const aA = a.score > 0 ? 1 : 0
-      const bA = b.score > 0 ? 1 : 0
-      if (aA !== bA) return bA - aA
-      return a.dist - b.dist
-    })
-
-    let result = { x: candidates[0]!.x, y: candidates[0]!.y }
+    cands.sort((a, b) => { const aA = a.score > 0 ? 1 : 0, bA = b.score > 0 ? 1 : 0; return aA !== bA ? bA - aA : a.dist - b.dist })
+    let result = { x: cands[0]!.x, y: cands[0]!.y }
     for (let iter = 0; iter < 5; iter++) {
       let pushed = false
-      for (const obs2 of connected) {
-        const hw = obs2.width / 2 + this.margin + 0.05
-        const hh = obs2.height / 2 + this.margin + 0.05
-        const d2x = result.x - obs2.center.x
-        const d2y = result.y - obs2.center.y
-        if (Math.abs(d2x) < hw && Math.abs(d2y) < hh) {
-          const dr = hw - d2x
-          const dl = hw + d2x
-          const dt = hh - d2y
-          const db = hh + d2y
+      for (const o of connected) {
+        const w = o.width / 2 + this.margin + 0.05, h = o.height / 2 + this.margin + 0.05
+        const rx = result.x - o.center.x, ry = result.y - o.center.y
+        if (Math.abs(rx) < w && Math.abs(ry) < h) {
+          const dr = w - rx, dl = w + rx, dt = h - ry, db = h + ry
           const m = Math.min(dr, dl, dt, db)
-          if (m === dr) result = { x: obs2.center.x + hw, y: result.y }
-          else if (m === dl) result = { x: obs2.center.x - hw, y: result.y }
-          else if (m === db) result = { x: result.x, y: obs2.center.y - hh }
-          else result = { x: result.x, y: obs2.center.y + hh }
+          if (m === dr) result = { x: o.center.x + w, y: result.y }
+          else if (m === dl) result = { x: o.center.x - w, y: result.y }
+          else if (m === db) result = { x: result.x, y: o.center.y - h }
+          else result = { x: result.x, y: o.center.y + h }
           pushed = true
         }
       }
@@ -300,964 +217,557 @@ export class TopologicalPathSolver extends BaseSolver {
     return result
   }
 
-  // ===== CDT-EDGE A* ROUTING =====
-
-  /**
-   * Locate which CDT triangle contains a point.
-   */
-  private locateTriangle(cdt: RawCdt, pt: Point): number {
-    for (let ti = 0; ti < cdt.triangles.length; ti++) {
-      const tri = cdt.triangles[ti]!
-      if (tri.obstacle) continue
-      if (this.pointInTriangle(cdt.pts, tri.v, pt)) return ti
-    }
-    // Fallback: nearest non-obstacle triangle centroid
-    let bestDist = Infinity
-    let bestTi = -1
-    for (let ti = 0; ti < cdt.triangles.length; ti++) {
-      const tri = cdt.triangles[ti]!
-      if (tri.obstacle) continue
-      const cx =
-        (cdt.pts[tri.v[0]]!.x + cdt.pts[tri.v[1]]!.x + cdt.pts[tri.v[2]]!.x) / 3
-      const cy =
-        (cdt.pts[tri.v[0]]!.y + cdt.pts[tri.v[1]]!.y + cdt.pts[tri.v[2]]!.y) / 3
-      const d = (pt.x - cx) ** 2 + (pt.y - cy) ** 2
-      if (d < bestDist) {
-        bestDist = d
-        bestTi = ti
-      }
-    }
-    return bestTi
-  }
-
-  private pointInTriangle(
-    pts: Point[],
-    v: [number, number, number],
-    p: Point,
-  ): boolean {
-    const a = pts[v[0]]!
-    const b = pts[v[1]]!
-    const c = pts[v[2]]!
-    const d1 = (p.x - b.x) * (a.y - b.y) - (a.x - b.x) * (p.y - b.y)
-    const d2 = (p.x - c.x) * (b.y - c.y) - (b.x - c.x) * (p.y - c.y)
-    const d3 = (p.x - a.x) * (c.y - a.y) - (c.x - a.x) * (p.y - a.y)
-    const hasNeg = d1 < 0 || d2 < 0 || d3 < 0
-    const hasPos = d1 > 0 || d2 > 0 || d3 > 0
-    return !(hasNeg && hasPos)
-  }
-
-  /**
-   * Get the edge index between two vertices in the CDT.
-   */
-  private getEdgeIdx(cdt: RawCdt, v0: number, v1: number): number {
-    const key = v0 < v1 ? `${v0},${v1}` : `${v1},${v0}`
-    return cdt.edgeMap.get(key) ?? -1
-  }
-
-  /**
-   * Get the edge capacity remaining after existing crossings.
-   * Capacity = edge length - (existing crossings * spacing)
-   */
-  private edgeRemainingCapacity(edge: CdtEdge): number {
-    const spacing = this.minTraceWidth + this.margin
-    const used = edge.crossings.length * spacing
-    return edge.length - used
-  }
-
-  /**
-   * A* search through CDT triangles. Returns both the path points AND
-   * the edge indices crossed, so we can properly record crossings.
-   */
-  private routeThroughCdt(
-    cdt: RawCdt,
-    start: Point,
-    end: Point,
-    connectionName: string,
-  ): { path: Point[]; edgesCrossed: number[] } | null {
-    const startTri = this.locateTriangle(cdt, start)
-    const endTri = this.locateTriangle(cdt, end)
-    if (startTri < 0 || endTri < 0) return null
-
-    interface AStarNode {
-      triIdx: number
-      point: Point
-      g: number
-      f: number
-      parent: AStarNode | null
-      entryEdge: number // CDT edge index crossed to reach this triangle
-    }
-
-    const spacing = this.minTraceWidth + this.margin
-    const baseNet = TopologicalPathSolver.baseNetName(connectionName)
-
-    const open: AStarNode[] = []
-    const closed = new Set<number>()
-    const h = (p: Point) => distance(p, end)
-
-    open.push({
-      triIdx: startTri,
-      point: start,
-      g: 0,
-      f: h(start),
-      parent: null,
-      entryEdge: -1,
-    })
-
-    while (open.length > 0) {
-      let bestIdx = 0
-      for (let i = 1; i < open.length; i++) {
-        if (open[i]!.f < open[bestIdx]!.f) bestIdx = i
-      }
-      const current = open[bestIdx]!
-      open.splice(bestIdx, 1)
-
-      if (closed.has(current.triIdx)) continue
-      closed.add(current.triIdx)
-
-      if (current.triIdx === endTri) {
-        // Reconstruct path + edge list
-        const path: Point[] = [end]
-        const edgesCrossed: number[] = []
-        let node: AStarNode | null = current
-        while (node) {
-          path.push(node.point)
-          if (node.entryEdge >= 0) edgesCrossed.push(node.entryEdge)
-          node = node.parent
-        }
-        path.reverse()
-        edgesCrossed.reverse()
-        return { path, edgesCrossed }
-      }
-
-      const tri = cdt.triangles[current.triIdx]!
-      const triEdges = [
-        { neighborSlot: 0, v0: tri.v[1], v1: tri.v[2] },
-        { neighborSlot: 1, v0: tri.v[2], v1: tri.v[0] },
-        { neighborSlot: 2, v0: tri.v[0], v1: tri.v[1] },
-      ]
-
-      for (const { neighborSlot, v0, v1 } of triEdges) {
-        const neighborTri = tri.n[neighborSlot]
-        if (neighborTri < 0) continue
-        if (closed.has(neighborTri)) continue
-
-        const neighborTriObj = cdt.triangles[neighborTri]!
-        if (neighborTriObj.obstacle) continue
-
-        const edgeIdx = this.getEdgeIdx(cdt, v0, v1)
-        if (edgeIdx < 0) continue
-
-        const edge = cdt.edges[edgeIdx]!
-        if (edge.isConstraint) continue
-
-        // Check capacity
-        if (this.edgeRemainingCapacity(edge) < spacing) {
-          const allSameNet = edge.crossings.every(
-            (c) => TopologicalPathSolver.baseNetName(c.connectionName) === baseNet,
-          )
-          if (!allSameNet) continue
-        }
-
-        // Crossing point: midpoint (will be adjusted by spaceEdges later)
-        const p0 = cdt.pts[v0]!
-        const p1 = cdt.pts[v1]!
-        const crossPt = { x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2 }
-
-        const stepDist = distance(current.point, crossPt)
-        open.push({
-          triIdx: neighborTri,
-          point: crossPt,
-          g: current.g + stepDist,
-          f: current.g + stepDist + h(crossPt),
-          parent: current,
-          entryEdge: edgeIdx,
-        })
-      }
-    }
-
-    return null
-  }
-
-  /**
-   * Record edge crossings from a routed path. Uses the known edge indices
-   * from A* rather than searching by distance.
-   */
-  private recordEdgeCrossings(
-    cdt: RawCdt,
-    edgesCrossed: number[],
-    connectionName: string,
-    routeIdx: number,
-  ) {
-    for (const edgeIdx of edgesCrossed) {
-      const edge = cdt.edges[edgeIdx]!
-      edge.crossings.push({
-        connectionName,
-        t: 0.5, // initial placement at midpoint; spaceEdges will fix
-        point: { x: 0, y: 0 }, // will be computed by spaceEdges
-      })
-    }
-  }
-
-  /**
-   * gEDA-style edge spacing: distribute route crossings evenly along
-   * each shared CDT edge, maintaining minimum clearance from edge
-   * endpoints (obstacle vertices) and between crossings.
-   *
-   * After this, update all route paths to use the new crossing positions.
-   */
-  private spaceAllEdges(cdt: RawCdt) {
-    const spacing = this.minTraceWidth + this.margin
-
-    for (const edge of cdt.edges) {
-      const n = edge.crossings.length
-      if (n === 0) continue
-
-      const ep0 = cdt.pts[edge.v0]!
-      const ep1 = cdt.pts[edge.v1]!
-      const edgeLen = edge.length
-      if (edgeLen < 1e-9) continue
-
-      // Reserve spacing from endpoints (obstacle vertices need clearance)
-      const endClear = spacing / 2
-      const usableStart = endClear / edgeLen
-      const usableEnd = 1 - endClear / edgeLen
-
-      if (usableStart >= usableEnd) {
-        // Edge too short — pack at midpoint
-        for (let i = 0; i < n; i++) {
-          edge.crossings[i]!.t = 0.5
-        }
-      } else if (n === 1) {
-        // Single crossing — place at center of usable range
-        edge.crossings[0]!.t = (usableStart + usableEnd) / 2
-      } else {
-        // Multiple crossings — distribute evenly in usable range
-        const step = (usableEnd - usableStart) / (n - 1)
-        for (let i = 0; i < n; i++) {
-          edge.crossings[i]!.t = usableStart + i * step
-        }
-      }
-
-      // Update crossing point positions
-      for (const crossing of edge.crossings) {
-        crossing.point = {
-          x: ep0.x + crossing.t * (ep1.x - ep0.x),
-          y: ep0.y + crossing.t * (ep1.y - ep0.y),
-        }
-      }
-    }
-  }
-
-  /**
-   * After spaceAllEdges, rebuild each route's path using the updated
-   * crossing positions from the CDT edges.
-   */
-  // updateRoutePathsFromCrossings removed — use rebuildPathFromCrossings per-route instead
-
-  private pointToSegmentDist(p: Point, a: Point, b: Point): number {
-    const dx = b.x - a.x
-    const dy = b.y - a.y
-    const len2 = dx * dx + dy * dy
-    if (len2 < 1e-12) return distance(p, a)
-    const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2))
-    const projX = a.x + t * dx
-    const projY = a.y + t * dy
-    return Math.hypot(p.x - projX, p.y - projY)
-  }
-
-  /**
-   * Rubber-band a route: for each crossing, slide it along its CDT edge
-   * to where the straight line from prev→next would intersect that edge.
-   * Modifies the edge crossing records directly (single source of truth).
-   */
-  private rubberBandRoute(cdt: RawCdt, route: TopoRouteState) {
-    const edgesCrossed = (route as any)._edgesCrossed as number[] | undefined
-    if (!edgesCrossed || edgesCrossed.length === 0) return
-
-    const spacing = this.minTraceWidth / 2 + this.margin
-
-    // Get current crossing positions to use as "original" reference
-    const crossingPts: Point[] = edgesCrossed.map((ei) => {
-      const edge = cdt.edges[ei]!
-      const c = edge.crossings.find((c) => c.connectionName === route.connectionName)
-      return c ? { ...c.point } : { x: 0, y: 0 }
-    })
-
-    for (let i = 0; i < edgesCrossed.length; i++) {
-      // prev = start or previous crossing (use updated for forward convergence)
-      const prev = i === 0
-        ? route.start
-        : (() => {
-            const prevEdge = cdt.edges[edgesCrossed[i - 1]!]!
-            const prevC = prevEdge.crossings.find((c) => c.connectionName === route.connectionName)
-            return prevC ? prevC.point : route.start
-          })()
-      // next = next crossing or end (use original to avoid cascading)
-      const next = i === edgesCrossed.length - 1
-        ? route.end
-        : crossingPts[i + 1]!
-
-      const edgeIdx = edgesCrossed[i]!
-      const edge = cdt.edges[edgeIdx]!
-      const ep0 = cdt.pts[edge.v0]!
-      const ep1 = cdt.pts[edge.v1]!
-
-      const ideal = this.bestEdgeCrossingPoint(prev, next, ep0, ep1)
-      if (!ideal) continue
-
-      const edgeLen = edge.length
-      if (edgeLen < 1e-9) continue
-
-      const edx = ep1.x - ep0.x
-      const edy = ep1.y - ep0.y
-      let t = ((ideal.x - ep0.x) * edx + (ideal.y - ep0.y) * edy) / (edgeLen * edgeLen)
-
-      // Clamp: stay away from edge endpoints by at least spacing or 5%
-      const tMin = Math.max(0.05, spacing / edgeLen)
-      const tMax = Math.min(0.95, 1 - spacing / edgeLen)
-      if (tMin >= tMax) continue // edge too short for this clearance
-      t = Math.max(tMin, Math.min(tMax, t))
-
-      // Respect crossing order
-      const myIdx = edge.crossings.findIndex(
-        (c) => c.connectionName === route.connectionName,
-      )
-      if (myIdx >= 0) {
-        const minGap = spacing / edgeLen
-        const prevCross = edge.crossings[myIdx - 1]
-        const nextCross = edge.crossings[myIdx + 1]
-        if (prevCross) t = Math.max(t, prevCross.t + minGap)
-        if (nextCross) t = Math.min(t, nextCross.t - minGap)
-
-        edge.crossings[myIdx]!.t = t
-        edge.crossings[myIdx]!.point = {
-          x: ep0.x + t * edx,
-          y: ep0.y + t * edy,
-        }
-      }
-    }
-  }
-
-  /**
-   * Rebuild a route's path from the authoritative edge crossing positions.
-   */
-  private rebuildPathFromCrossings(cdt: RawCdt, route: TopoRouteState) {
-    const edgesCrossed = (route as any)._edgesCrossed as number[] | undefined
-    if (!edgesCrossed) return
-
-    const newPath: Point[] = [route.start]
-    for (const edgeIdx of edgesCrossed) {
-      const edge = cdt.edges[edgeIdx]!
-      const crossing = edge.crossings.find(
-        (c) => c.connectionName === route.connectionName,
-      )
-      if (crossing) newPath.push({ ...crossing.point })
-    }
-    newPath.push(route.end)
-    route.path = newPath
-  }
-
-  /**
-   * Find the best point on edge c→d for rubber-banding between a and b.
-   * If the line a→b crosses the edge, returns the intersection.
-   * Otherwise, returns the point on the edge closest to line a→b.
-   */
-  private bestEdgeCrossingPoint(
-    a: Point, b: Point, c: Point, d: Point,
-  ): Point | null {
-    const dx1 = b.x - a.x, dy1 = b.y - a.y
-    const dx2 = d.x - c.x, dy2 = d.y - c.y
-    const denom = dx1 * dy2 - dy1 * dx2
-
-    if (Math.abs(denom) < 1e-12) {
-      // Lines parallel — project midpoint of a,b onto edge c→d
-      const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2
-      const len2 = dx2 * dx2 + dy2 * dy2
-      if (len2 < 1e-12) return null
-      const t = Math.max(0, Math.min(1, ((mx - c.x) * dx2 + (my - c.y) * dy2) / len2))
-      return { x: c.x + t * dx2, y: c.y + t * dy2 }
-    }
-
-    // Intersection of line a→b with line c→d
-    const t2 = ((a.x - c.x) * dy1 - (a.y - c.y) * dx1) / denom
-    const t2c = Math.max(0, Math.min(1, t2))
-    return { x: c.x + t2c * dx2, y: c.y + t2c * dy2 }
-  }
-
   static baseNetName(connectionName: string): string {
     const m = connectionName.match(/^(.+?)_mst\d+$/)
     return m ? m[1]! : connectionName
   }
 
-  // ===== SOLVER STEP LOGIC =====
+  // ===== CDT HELPERS =====
+
+  private locateTriangle(cdt: RawCdt, pt: Point): number {
+    for (let ti = 0; ti < cdt.triangles.length; ti++) {
+      const tri = cdt.triangles[ti]!
+      if (tri.obstacle) continue
+      if (this.ptInTri(cdt.pts, tri.v, pt)) return ti
+    }
+    let bestD = Infinity, bestT = -1
+    for (let ti = 0; ti < cdt.triangles.length; ti++) {
+      const tri = cdt.triangles[ti]!; if (tri.obstacle) continue
+      const cx = (cdt.pts[tri.v[0]]!.x + cdt.pts[tri.v[1]]!.x + cdt.pts[tri.v[2]]!.x) / 3
+      const cy = (cdt.pts[tri.v[0]]!.y + cdt.pts[tri.v[1]]!.y + cdt.pts[tri.v[2]]!.y) / 3
+      const d = (pt.x - cx) ** 2 + (pt.y - cy) ** 2
+      if (d < bestD) { bestD = d; bestT = ti }
+    }
+    return bestT
+  }
+
+  private ptInTri(pts: Point[], v: [number, number, number], p: Point): boolean {
+    const a = pts[v[0]]!, b = pts[v[1]]!, c = pts[v[2]]!
+    const d1 = (p.x - b.x) * (a.y - b.y) - (a.x - b.x) * (p.y - b.y)
+    const d2 = (p.x - c.x) * (b.y - c.y) - (b.x - c.x) * (p.y - c.y)
+    const d3 = (p.x - a.x) * (c.y - a.y) - (c.x - a.x) * (p.y - a.y)
+    return !(d1 < 0 && (d2 > 0 || d3 > 0)) && !(d1 > 0 && (d2 < 0 || d3 < 0))
+  }
+
+  private edgeKey(a: number, b: number): string {
+    return a < b ? `${a},${b}` : `${b},${a}`
+  }
+
+  /** Winding: positive = left, negative = right, 0 = collinear */
+  private wind(ax: number, ay: number, bx: number, by: number, cx: number, cy: number): number {
+    const cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    if (cross > 1e-9) return 1
+    if (cross < -1e-9) return -1
+    return 0
+  }
+
+  /** Get edge routing list for a given layer/edge */
+  private getEdgeRouting(layerZ: number, edgeIdx: number): RouteVertex[] {
+    if (!this.edgeRoutingLists[layerZ]) return []
+    return this.edgeRoutingLists[layerZ]!.get(edgeIdx) ?? []
+  }
+
+  /** Insert a vertex into an edge's routing list (sorted by t) */
+  private insertIntoEdgeRouting(layerZ: number, edgeIdx: number, rv: RouteVertex) {
+    if (!this.edgeRoutingLists[layerZ]) this.edgeRoutingLists[layerZ] = new Map()
+    const list = this.edgeRoutingLists[layerZ]!.get(edgeIdx) ?? []
+    // Insert sorted by t
+    let idx = 0
+    while (idx < list.length && list[idx]!.t < rv.t) idx++
+    list.splice(idx, 0, rv)
+    this.edgeRoutingLists[layerZ]!.set(edgeIdx, list)
+  }
+
+  /** Edge capacity = geometric length */
+  private edgeCapacity(cdt: RawCdt, edgeIdx: number): number {
+    return cdt.edges[edgeIdx]!.length
+  }
+
+  /** Edge flow = total spacing consumed by existing route vertices */
+  private edgeFlow(layerZ: number, cdt: RawCdt, edgeIdx: number, destThickness: number): number {
+    const routing = this.getEdgeRouting(layerZ, edgeIdx)
+    if (routing.length === 0) return 0
+    const edge = cdt.edges[edgeIdx]!
+    let flow = 0
+    const ep0 = cdt.pts[edge.v0]!, ep1 = cdt.pts[edge.v1]!
+
+    // Flow from edge v0 to first routing vertex
+    flow += minSpacing({ thickness: 0 }, routing[0]!, this.margin)
+    // Flow between consecutive routing vertices
+    for (let i = 0; i < routing.length - 1; i++) {
+      flow += minSpacing(routing[i]!, routing[i + 1]!, this.margin)
+    }
+    // Flow from last routing vertex to edge v1
+    flow += minSpacing(routing[routing.length - 1]!, { thickness: 0 }, this.margin)
+    return flow
+  }
+
+  // ===== CANDIDATE VERTEX GENERATION (gEDA candidate_vertices) =====
+
+  /**
+   * Generate candidate routing vertices in the gap between v1pos and v2pos
+   * on the given edge. Returns up to 3 candidates.
+   */
+  private candidateVertices(
+    cdt: RawCdt,
+    layerZ: number,
+    edgeIdx: number,
+    v1t: number,
+    v2t: number,
+    destThickness: number,
+  ): RouteVertex[] {
+    const edge = cdt.edges[edgeIdx]!
+    const ep0 = cdt.pts[edge.v0]!, ep1 = cdt.pts[edge.v1]!
+    const edgeLen = edge.length
+    if (edgeLen < 1e-9) return []
+
+    // Check capacity
+    const flow = this.edgeFlow(layerZ, cdt, edgeIdx, destThickness)
+    if (flow >= edgeLen) return []
+
+    const gapLen = Math.abs(v2t - v1t) * edgeLen
+    const ms = this.minTraceWidth + this.margin
+    const v1ms = ms // spacing from v1 side
+    const v2ms = ms // spacing from v2 side
+
+    const tLow = Math.min(v1t, v2t)
+    const tHigh = Math.max(v1t, v2t)
+
+    if (v1ms + v2ms + ms >= gapLen) {
+      // Tight: single midpoint
+      const tMid = (tLow + tHigh) / 2
+      return [createTempVertex(edgeIdx, tMid, ep0, ep1, destThickness)]
+    }
+
+    const results: RouteVertex[] = []
+    const t1 = tLow + v1ms / edgeLen
+    const t2 = tHigh - v2ms / edgeLen
+    results.push(createTempVertex(edgeIdx, t1, ep0, ep1, destThickness))
+    results.push(createTempVertex(edgeIdx, t2, ep0, ep1, destThickness))
+
+    // Center candidate if space remains
+    const centerT = (t1 + t2) / 2
+    if (Math.abs(t2 - t1) * edgeLen > ms) {
+      results.push(createTempVertex(edgeIdx, centerT, ep0, ep1, destThickness))
+    }
+
+    return results
+  }
+
+  // ===== A* ROUTING (gEDA route()) =====
+
+  /**
+   * Route one connection through the CDT using A*.
+   * Places route vertices ON CDT edges. Uses winding checks
+   * to maintain topological consistency.
+   */
+  private routeConnection(
+    cdt: RawCdt,
+    layerZ: number,
+    conn: (typeof this.connections)[0],
+  ): RouteVertex[] | null {
+    const startTri = this.locateTriangle(cdt, conn.start)
+    const endTri = this.locateTriangle(cdt, conn.end)
+    if (startTri < 0 || endTri < 0) return null
+
+    const srcVertex = createFixedVertex(conn.start.x, conn.start.y, this.minTraceWidth)
+    const destVertex = createFixedVertex(conn.end.x, conn.end.y, this.minTraceWidth)
+    srcVertex.gcost = 0
+    srcVertex.hcost = distance(conn.start, conn.end)
+
+    // Open list sorted by f-cost
+    const open: RouteVertex[] = [srcVertex]
+    const closed = new Set<string>() // "x,y" keys for visited
+
+    const tempVertices: RouteVertex[] = [] // for cleanup
+
+    while (open.length > 0) {
+      // Pop lowest f-cost
+      let bestIdx = 0
+      for (let i = 1; i < open.length; i++) {
+        if ((open[i]!.gcost + open[i]!.hcost) < (open[bestIdx]!.gcost + open[bestIdx]!.hcost)) bestIdx = i
+      }
+      const cur = open[bestIdx]!
+      open.splice(bestIdx, 1)
+
+      const curKey = `${cur.x.toFixed(4)},${cur.y.toFixed(4)}`
+      if (closed.has(curKey)) continue
+      closed.add(curKey)
+
+      // Check if we reached the destination triangle
+      const curTri = this.locateTriangle(cdt, cur)
+      if (curTri === endTri) {
+        // Check if we can directly reach the destination
+        const directDist = distance(cur, destVertex)
+        destVertex.parent = cur
+        destVertex.gcost = cur.gcost + directDist
+
+        // Extract path
+        const path: RouteVertex[] = []
+        let v: RouteVertex | null = destVertex
+        while (v) { path.push(v); v = v.parent }
+        path.reverse()
+        return path
+      }
+
+      // Generate candidates
+      const candidates = this.computeCandidatePoints(cdt, layerZ, cur, destVertex)
+
+      for (const cand of candidates) {
+        const candKey = `${cand.x.toFixed(4)},${cand.y.toFixed(4)}`
+        if (closed.has(candKey)) continue
+
+        const g = cur.gcost + distance(cur, cand)
+        const h = distance(cand, destVertex)
+
+        // Check if already in open list with better cost
+        const existing = open.find((o) => Math.abs(o.x - cand.x) < 1e-6 && Math.abs(o.y - cand.y) < 1e-6)
+        if (existing) {
+          if (g < existing.gcost) {
+            existing.gcost = g
+            existing.hcost = h
+            existing.parent = cur
+          }
+          continue
+        }
+
+        cand.gcost = g
+        cand.hcost = h
+        cand.parent = cur
+        open.push(cand)
+        tempVertices.push(cand)
+      }
+    }
+
+    return null // No path found
+  }
+
+  /**
+   * Generate candidate points from current position (gEDA compute_candidate_points).
+   * If cur is a fixed vertex: explore all adjacent triangles.
+   * If cur is on an edge: explore only the triangle on the OPPOSITE side from parent (winding check).
+   */
+  private computeCandidatePoints(
+    cdt: RawCdt,
+    layerZ: number,
+    cur: RouteVertex,
+    dest: RouteVertex,
+  ): RouteVertex[] {
+    const candidates: RouteVertex[] = []
+
+    if (cur.edgeIdx < 0) {
+      // Fixed vertex (CDT vertex or terminal) — explore all adjacent triangles
+      const curTri = this.locateTriangle(cdt, cur)
+      if (curTri < 0) return candidates
+
+      // Find all triangles sharing this point
+      const tris = this.findTrianglesContainingPoint(cdt, cur)
+      for (const ti of tris) {
+        const tri = cdt.triangles[ti]!
+        if (tri.obstacle) continue
+        // Generate candidates on the two edges NOT adjacent to cur
+        const edgePairs = [
+          { slot: 0, v0: tri.v[1], v1: tri.v[2] },
+          { slot: 1, v0: tri.v[2], v1: tri.v[0] },
+          { slot: 2, v0: tri.v[0], v1: tri.v[1] },
+        ]
+        for (const ep of edgePairs) {
+          const edgeIdx = cdt.edgeMap.get(this.edgeKey(ep.v0, ep.v1))
+          if (edgeIdx === undefined) continue
+          const edge = cdt.edges[edgeIdx]!
+          if (edge.isConstraint) continue
+
+          const cands = this.candidateVerticesOnEdge(cdt, layerZ, edgeIdx, dest.thickness)
+          candidates.push(...cands)
+        }
+      }
+    } else {
+      // Temp vertex on an edge — use winding check to pick correct triangle
+      const edge = cdt.edges[cur.edgeIdx]!
+      const ep0 = cdt.pts[edge.v0]!, ep1 = cdt.pts[edge.v1]!
+
+      // Winding of parent relative to edge
+      const parentWind = cur.parent
+        ? this.wind(ep0.x, ep0.y, ep1.x, ep1.y, cur.parent.x, cur.parent.y)
+        : 0
+
+      // Explore the triangle on the opposite side from parent
+      for (const triIdx of [edge.t0, edge.t1]) {
+        if (triIdx < 0) continue
+        const tri = cdt.triangles[triIdx]!
+        if (tri.obstacle) continue
+
+        // Find the opposite vertex of this triangle
+        const oppIdx = tri.v.find((vi) => vi !== edge.v0 && vi !== edge.v1)
+        if (oppIdx === undefined) continue
+        const oppV = cdt.pts[oppIdx]!
+
+        const oppWind = this.wind(ep0.x, ep0.y, ep1.x, ep1.y, oppV.x, oppV.y)
+
+        // gEDA: only explore if oppWind != parentWind (opposite side)
+        if (parentWind !== 0 && oppWind === parentWind) continue
+
+        // Generate candidates on the two edges of this triangle that aren't cur.edgeIdx
+        const triEdges = [
+          [tri.v[0], tri.v[1]],
+          [tri.v[1], tri.v[2]],
+          [tri.v[2], tri.v[0]],
+        ]
+        for (const [va, vb] of triEdges) {
+          const ek = this.edgeKey(va!, vb!)
+          const ei = cdt.edgeMap.get(ek)
+          if (ei === undefined || ei === cur.edgeIdx) continue
+          const e = cdt.edges[ei]!
+          if (e.isConstraint) continue
+
+          const cands = this.candidateVerticesOnEdge(cdt, layerZ, ei, dest.thickness)
+          candidates.push(...cands)
+        }
+      }
+    }
+
+    return candidates
+  }
+
+  /** Find all non-obstacle triangles containing/adjacent to a point */
+  private findTrianglesContainingPoint(cdt: RawCdt, pt: Point): number[] {
+    const tris: number[] = []
+    for (let ti = 0; ti < cdt.triangles.length; ti++) {
+      const tri = cdt.triangles[ti]!
+      if (tri.obstacle) continue
+      if (this.ptInTri(cdt.pts, tri.v, pt)) tris.push(ti)
+    }
+    // If none found by containment, find nearest
+    if (tris.length === 0) {
+      const nearest = this.locateTriangle(cdt, pt)
+      if (nearest >= 0) tris.push(nearest)
+    }
+    return tris
+  }
+
+  /**
+   * Generate candidate vertices along an edge, finding gaps between
+   * existing route vertices (gEDA-style).
+   */
+  private candidateVerticesOnEdge(
+    cdt: RawCdt,
+    layerZ: number,
+    edgeIdx: number,
+    destThickness: number,
+  ): RouteVertex[] {
+    const routing = this.getEdgeRouting(layerZ, edgeIdx)
+    const candidates: RouteVertex[] = []
+
+    if (routing.length === 0) {
+      // No existing routing — candidates across full edge
+      return this.candidateVertices(cdt, layerZ, edgeIdx, 0, 1, destThickness)
+    }
+
+    // Find gaps between existing route vertices
+    // Gap from edge start (t=0) to first route vertex
+    candidates.push(...this.candidateVertices(cdt, layerZ, edgeIdx, 0, routing[0]!.t, destThickness))
+
+    // Gaps between consecutive route vertices
+    for (let i = 0; i < routing.length - 1; i++) {
+      candidates.push(...this.candidateVertices(cdt, layerZ, edgeIdx, routing[i]!.t, routing[i + 1]!.t, destThickness))
+    }
+
+    // Gap from last route vertex to edge end (t=1)
+    candidates.push(...this.candidateVertices(cdt, layerZ, edgeIdx, routing[routing.length - 1]!.t, 1, destThickness))
+
+    return candidates
+  }
+
+  // ===== SPACE EDGES (gEDA space_edge()) =====
+
+  /**
+   * Force-based relaxation to spread route vertices evenly on shared edges.
+   * 100 iterations with 0.1 damping, like gEDA.
+   */
+  private spaceEdge(cdt: RawCdt, layerZ: number, edgeIdx: number) {
+    const edge = cdt.edges[edgeIdx]!
+    if (edge.isConstraint) return
+
+    const routing = this.getEdgeRouting(layerZ, edgeIdx)
+    if (routing.length === 0) return
+
+    const ep0 = cdt.pts[edge.v0]!, ep1 = cdt.pts[edge.v1]!
+    const edgeLen = edge.length
+    if (edgeLen < 1e-9) return
+
+    const forces = new Float64Array(routing.length)
+
+    for (let iter = 0; iter < 100; iter++) {
+      let equilibrium = true
+
+      // Compute forces
+      for (let k = 0; k < routing.length; k++) {
+        const v = routing[k]!
+        let force = 0
+
+        // Force from previous (or edge start)
+        const prevT = k > 0 ? routing[k - 1]!.t : 0
+        const prevThickness = k > 0 ? routing[k - 1]!.thickness : 0
+        const ms1 = minSpacing(v, { thickness: prevThickness }, this.margin)
+        const d1 = (v.t - prevT) * edgeLen
+        if (d1 < ms1) force += (ms1 - d1) // push toward v1 direction
+
+        // Force from next (or edge end)
+        const nextT = k < routing.length - 1 ? routing[k + 1]!.t : 1
+        const nextThickness = k < routing.length - 1 ? routing[k + 1]!.thickness : 0
+        const ms2 = minSpacing(v, { thickness: nextThickness }, this.margin)
+        const d2 = (nextT - v.t) * edgeLen
+        if (d2 < ms2) force -= (ms2 - d2) // push toward v0 direction
+
+        forces[k] = force
+      }
+
+      // Apply forces with damping
+      for (let k = 0; k < routing.length; k++) {
+        if (Math.abs(forces[k]!) > 1e-6) equilibrium = false
+        const dt = (forces[k]! * 0.1) / edgeLen // convert distance to t-delta
+        routing[k]!.t += dt
+        routing[k]!.t = Math.max(0.01, Math.min(0.99, routing[k]!.t))
+        // Update position
+        routing[k]!.x = ep0.x + routing[k]!.t * (ep1.x - ep0.x)
+        routing[k]!.y = ep0.y + routing[k]!.t * (ep1.y - ep0.y)
+      }
+
+      if (equilibrium) break
+    }
+  }
+
+  // ===== SOLVER PHASES =====
 
   _step() {
     switch (this.phase) {
-      case "build-cdt":
-        this.stepBuildCdt()
-        break
-      case "route":
-        this.stepRoute()
-        break
-      case "rubberband":
-        this.stepRubberBand()
-        break
-      case "commit":
-        this.stepCommit()
-        break
-      case "done":
-        this.solved = true
-        break
+      case "build-cdt": this.stepBuildCdt(); break
+      case "route": this.stepRoute(); break
+      case "space": this.stepSpace(); break
+      case "commit": this.stepCommit(); break
+      case "done": this.solved = true; break
     }
   }
 
   private stepBuildCdt() {
     this.cdts = []
+    this.edgeRoutingLists = []
     for (let z = 0; z < this.layerCount; z++) {
-      const mergedRects = mergeOverlappingRects(
-        this.baseObstaclePolygons[z]?.slice() ?? [],
-      )
-      const cdt = buildRawCdt(this.srj.bounds, mergedRects)
-      this.cdts.push(cdt)
+      const merged = mergeOverlappingRects(this.baseObstaclePolygons[z]?.slice() ?? [])
+      this.cdts.push(buildRawCdt(this.srj.bounds, merged))
+      this.edgeRoutingLists.push(new Map())
     }
     this.phase = "route"
     this.routeIndex = 0
   }
 
   private stepRoute() {
-    // Route in batches
-    const batchSize = 10
+    const batchSize = 5
     const end = Math.min(this.routeIndex + batchSize, this.connections.length)
 
     for (let i = this.routeIndex; i < end; i++) {
       const conn = this.connections[i]!
-      const route = this.routeConnection(conn)
-      if (route) {
-        this.routes.push(route)
+      const preferredLayer = conn.startLayerZ
+      const altLayer = preferredLayer === 0 ? 1 : 0
+
+      let routed = false
+      const tryLayer = (lz: number) => {
+        if (lz >= this.layerCount || routed) return
+        const cdt = this.cdts[lz]
+        if (!cdt) return
+        const path = this.routeConnection(cdt, lz, conn)
+        if (!path) return
+
+        // Commit: insert route vertices into edge routing lists (gEDA apply_route)
+        for (const rv of path) {
+          rv.routeName = conn.name
+          rv.isTemp = false
+          if (rv.edgeIdx >= 0) {
+            this.insertIntoEdgeRouting(lz, rv.edgeIdx, rv)
+          }
+        }
+
+        // Link parent/child
+        for (let j = 0; j < path.length - 1; j++) {
+          path[j]!.child = path[j + 1]!
+          path[j + 1]!.parent = path[j]!
+        }
+
+        this.committedPaths.push({
+          name: conn.name,
+          vertices: path,
+          layerZ: lz,
+          originalStart: conn.originalStart,
+          originalEnd: conn.originalEnd,
+          startLayerZ: conn.startLayerZ,
+          endLayerZ: conn.endLayerZ,
+        })
+        routed = true
       }
+
+      if (conn.startLayerZ === conn.endLayerZ) tryLayer(conn.startLayerZ)
+      if (!routed) tryLayer(preferredLayer)
+      if (!routed) tryLayer(altLayer)
     }
 
     this.routeIndex = end
     if (this.routeIndex >= this.connections.length) {
-      // STEP 1: Space all edge crossings evenly (gEDA space_edge)
-      for (let z = 0; z < this.layerCount; z++) {
-        const cdt = this.cdts[z]
-        if (cdt) this.spaceAllEdges(cdt)
-      }
-      // STEP 2: Rebuild route paths from the spaced crossing positions
-      for (const route of this.routes) {
-        const cdt = this.cdts[route.routeLayerZ]
-        if (cdt) this.rebuildPathFromCrossings(cdt, route)
-      }
-      this.phase = "rubberband"
-      this.rubberBandIter = 0
+      this.phase = "space"
     }
   }
 
-  private routeConnection(
-    conn: (typeof this.connections)[0],
-  ): TopoRouteState | null {
-    const preferredLayer = conn.startLayerZ
-    const altLayer = preferredLayer === 0 ? 1 : 0
-
-    const tryLayer = (layerZ: number, needStartVia: boolean, needEndVia: boolean) => {
-      if (layerZ >= this.layerCount) return null
-      const cdt = this.cdts[layerZ]
-      if (!cdt) return null
-      const result = this.routeThroughCdt(cdt, conn.start, conn.end, conn.name)
-      if (!result) return null
-      const routeIdx = this.routes.length
-      this.recordEdgeCrossings(cdt, result.edgesCrossed, conn.name, routeIdx)
-      const state: TopoRouteState = {
-        connectionName: conn.name,
-        path: result.path,
-        routeLayerZ: layerZ,
-        originalStart: conn.originalStart,
-        originalEnd: conn.originalEnd,
-        start: conn.start,
-        end: conn.end,
-        startLayerZ: conn.startLayerZ,
-        endLayerZ: conn.endLayerZ,
-        needsStartVia: needStartVia,
-        needsEndVia: needEndVia,
-      }
-      ;(state as any)._edgesCrossed = result.edgesCrossed
-      return state
-    }
-
-    // Try same-layer first
-    if (conn.startLayerZ === conn.endLayerZ) {
-      const r = tryLayer(conn.startLayerZ, false, false)
-      if (r) return r
-    }
-
-    // Try each layer with vias
-    for (const layerZ of [preferredLayer, altLayer]) {
-      const r = tryLayer(layerZ, conn.startLayerZ !== layerZ, conn.endLayerZ !== layerZ)
-      if (r) return r
-    }
-
-    return null
-  }
-
-  private stepRubberBand() {
-    if (this.rubberBandIter >= 10) {
-      this.finishRubberBand()
-      return
-    }
-
-    let anyImproved = false
-
-    // For each route, pull crossing points toward the straight-line ideal.
-    // This modifies the edge crossing positions directly.
-    for (const route of this.routes) {
-      const cdt = this.cdts[route.routeLayerZ]
-      if (!cdt) continue
-
-      const oldLen = this.pathLength(route.path)
-      this.rubberBandRoute(cdt, route)
-      // Rebuild path from authoritative edge crossings
-      this.rebuildPathFromCrossings(cdt, route)
-      const newLen = this.pathLength(route.path)
-
-      if (newLen < oldLen - 1e-6) anyImproved = true
-    }
-
-    this.rubberBandIter++
-    if (!anyImproved) this.finishRubberBand()
-  }
-
-  private finishRubberBand() {
-    // Re-run edge spacing to maximize geometric divergence
+  private stepSpace() {
+    // gEDA: space_edge on all edges after all routes committed
     for (let z = 0; z < this.layerCount; z++) {
       const cdt = this.cdts[z]
-      if (cdt) this.spaceAllEdges(cdt)
+      if (!cdt) continue
+      for (let ei = 0; ei < cdt.edges.length; ei++) {
+        this.spaceEdge(cdt, z, ei)
+      }
     }
-    for (const route of this.routes) {
-      const cdt = this.cdts[route.routeLayerZ]
-      if (cdt) this.rebuildPathFromCrossings(cdt, route)
-    }
-
-    // Simplify paths: remove crossings where the straight line from
-    // prev→next doesn't cross any constraint edge. This eliminates
-    // CDT-structure zigzag without changing the topological embedding.
-    // Note: this may reduce separation between routes that share edge
-    // corridors, but the alternative (keeping crossings) causes worse
-    // overlaps because CDT vertex convergence is the actual overlap source.
-    for (const route of this.routes) {
-      const cdt = this.cdts[route.routeLayerZ]
-      if (cdt) this.simplifyPath(cdt, route)
-    }
-
     this.phase = "commit"
   }
 
-  /**
-   * For each pair of route segments on the same layer that are closer
-   * than minSpacing, push them apart by offsetting perpendicular to
-   * the segment direction. Like gEDA's space_edge() but operating on
-   * the simplified geometric paths.
-   */
-  private separateOverlappingTraces() {
-    const minSpacing = this.minTraceWidth + this.margin
-
-    // Multiple passes for convergence
-    for (let pass = 0; pass < 5; pass++) {
-      let anyMoved = false
-
-      for (let i = 0; i < this.routes.length; i++) {
-        const ri = this.routes[i]!
-        for (let j = i + 1; j < this.routes.length; j++) {
-          const rj = this.routes[j]!
-          if (ri.routeLayerZ !== rj.routeLayerZ) continue
-
-          // Skip same net
-          const netI = TopologicalPathSolver.baseNetName(ri.connectionName)
-          const netJ = TopologicalPathSolver.baseNetName(rj.connectionName)
-          if (netI === netJ) continue
-
-          // Check all segment pairs
-          for (let si = 0; si < ri.path.length - 1; si++) {
-            for (let sj = 0; sj < rj.path.length - 1; sj++) {
-              const a1 = ri.path[si]!, a2 = ri.path[si + 1]!
-              const b1 = rj.path[sj]!, b2 = rj.path[sj + 1]!
-
-              // Find closest points between segments
-              const result = this.closestPointsBetweenSegments(a1, a2, b1, b2)
-              if (!result || result.dist >= minSpacing) continue
-
-              // Push apart: offset both segments perpendicular to their midline
-              const gap = minSpacing - result.dist
-              const halfGap = gap / 2 + 0.01 // small extra margin
-
-              // Direction to push: perpendicular to the line between closest points
-              let dx = result.pb.x - result.pa.x
-              let dy = result.pb.y - result.pa.y
-              const d = Math.hypot(dx, dy)
-              if (d < 1e-9) {
-                // Points coincide — use perpendicular to segment direction
-                const sdx = a2.x - a1.x, sdy = a2.y - a1.y
-                const slen = Math.hypot(sdx, sdy)
-                if (slen < 1e-9) continue
-                dx = -sdy / slen
-                dy = sdx / slen
-              } else {
-                dx /= d
-                dy /= d
-              }
-
-              // Push movable interior points (don't move start/end)
-              if (si > 0 && si < ri.path.length - 1) {
-                ri.path[si] = { x: ri.path[si]!.x - dx * halfGap, y: ri.path[si]!.y - dy * halfGap }
-                anyMoved = true
-              }
-              if (si + 1 > 0 && si + 1 < ri.path.length - 1) {
-                ri.path[si + 1] = { x: ri.path[si + 1]!.x - dx * halfGap, y: ri.path[si + 1]!.y - dy * halfGap }
-                anyMoved = true
-              }
-              if (sj > 0 && sj < rj.path.length - 1) {
-                rj.path[sj] = { x: rj.path[sj]!.x + dx * halfGap, y: rj.path[sj]!.y + dy * halfGap }
-                anyMoved = true
-              }
-              if (sj + 1 > 0 && sj + 1 < rj.path.length - 1) {
-                rj.path[sj + 1] = { x: rj.path[sj + 1]!.x + dx * halfGap, y: rj.path[sj + 1]!.y + dy * halfGap }
-                anyMoved = true
-              }
-            }
-          }
-        }
-      }
-
-      if (!anyMoved) break
-    }
-  }
-
-  private closestPointsBetweenSegments(
-    a1: Point, a2: Point, b1: Point, b2: Point,
-  ): { pa: Point; pb: Point; dist: number } | null {
-    // Parametric closest approach between two line segments
-    const dax = a2.x - a1.x, day = a2.y - a1.y
-    const dbx = b2.x - b1.x, dby = b2.y - b1.y
-    const abx = b1.x - a1.x, aby = b1.y - a1.y
-
-    const lenA = Math.hypot(dax, day)
-    const lenB = Math.hypot(dbx, dby)
-    if (lenA < 1e-9 || lenB < 1e-9) return null
-
-    // Sample several points along each segment and find minimum
-    let bestDist = Infinity
-    let bestPa: Point = a1, bestPb: Point = b1
-    const steps = 8
-    for (let sa = 0; sa <= steps; sa++) {
-      const ta = sa / steps
-      const pax = a1.x + ta * dax, pay = a1.y + ta * day
-      for (let sb = 0; sb <= steps; sb++) {
-        const tb = sb / steps
-        const pbx = b1.x + tb * dbx, pby = b1.y + tb * dby
-        const d = Math.hypot(pax - pbx, pay - pby)
-        if (d < bestDist) {
-          bestDist = d
-          bestPa = { x: pax, y: pay }
-          bestPb = { x: pbx, y: pby }
-        }
-      }
-    }
-
-    return { pa: bestPa, pb: bestPb, dist: bestDist }
-  }
-
-  /**
-   * Conservative path simplification: remove crossing points ONLY if:
-   * 1. The straight line prev→next doesn't cross any constraint edge
-   * 2. The CDT edge this crossing is on has NO other routes on it
-   *    (shared edges must keep their crossings for route separation)
-   */
-  private simplifyPathConservative(cdt: RawCdt, route: TopoRouteState) {
-    const ec = (route as any)._edgesCrossed as number[] | undefined
-    if (!ec) return
-
-    // Build set of edges that are shared with other routes
-    const sharedEdges = new Set<number>()
-    for (const edgeIdx of ec) {
-      const edge = cdt.edges[edgeIdx]!
-      if (edge.crossings.length > 1) sharedEdges.add(edgeIdx)
-    }
-
-    // Collect constraint segments
-    const constraintSegs: { x1: number; y1: number; x2: number; y2: number }[] = []
-    for (const edge of cdt.edges) {
-      if (!edge.isConstraint) continue
-      const p0 = cdt.pts[edge.v0]!, p1 = cdt.pts[edge.v1]!
-      constraintSegs.push({ x1: p0.x, y1: p0.y, x2: p1.x, y2: p1.y })
-    }
-
-    let changed = true
-    while (changed) {
-      changed = false
-      const path = route.path
-      for (let i = 1; i < path.length - 1; i++) {
-        const edgeIdx = ec[i - 1]
-        if (edgeIdx === undefined) continue
-
-        // Keep shared-edge crossings
-        if (sharedEdges.has(edgeIdx)) continue
-
-        const prev = path[i - 1]!, next = path[i + 1]!
-
-        let crossesConstraint = false
-        for (const cs of constraintSegs) {
-          if (this.segmentsIntersect(
-            prev.x, prev.y, next.x, next.y,
-            cs.x1, cs.y1, cs.x2, cs.y2,
-          )) {
-            crossesConstraint = true
-            break
-          }
-        }
-
-        if (!crossesConstraint) {
-          path.splice(i, 1)
-          ec.splice(i - 1, 1)
-          changed = true
-          break
-        }
-      }
-    }
-  }
-
-  /**
-   * Aggressive path simplification (used when overlap prevention not needed).
-   */
-  private simplifyPath(cdt: RawCdt, route: TopoRouteState) {
-    // Collect constraint segments for intersection testing
-    const constraintSegs: { x1: number; y1: number; x2: number; y2: number }[] = []
-    for (const edge of cdt.edges) {
-      if (!edge.isConstraint) continue
-      const p0 = cdt.pts[edge.v0]!
-      const p1 = cdt.pts[edge.v1]!
-      constraintSegs.push({ x1: p0.x, y1: p0.y, x2: p1.x, y2: p1.y })
-    }
-
-    // Also treat other routes' path segments as soft obstacles for overlap prevention
-    const otherSegs: { x1: number; y1: number; x2: number; y2: number; net: string }[] = []
-    const baseNet = TopologicalPathSolver.baseNetName(route.connectionName)
-    for (const other of this.routes) {
-      if (other === route) continue
-      if (other.routeLayerZ !== route.routeLayerZ) continue
-      if (TopologicalPathSolver.baseNetName(other.connectionName) === baseNet) continue
-      for (let i = 0; i < other.path.length - 1; i++) {
-        const a = other.path[i]!, b = other.path[i + 1]!
-        otherSegs.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y, net: other.connectionName })
-      }
-    }
-
-    let changed = true
-    while (changed) {
-      changed = false
-      const path = route.path
-      for (let i = 1; i < path.length - 1; i++) {
-        const prev = path[i - 1]!
-        const next = path[i + 1]!
-
-        // Check if we can skip this point
-        let crossesConstraint = false
-        for (const cs of constraintSegs) {
-          if (this.segmentsIntersect(
-            prev.x, prev.y, next.x, next.y,
-            cs.x1, cs.y1, cs.x2, cs.y2,
-          )) {
-            crossesConstraint = true
-            break
-          }
-        }
-
-        if (!crossesConstraint) {
-          // Safe to remove — splice it out
-          path.splice(i, 1)
-          // Also update _edgesCrossed
-          const ec = (route as any)._edgesCrossed as number[] | undefined
-          if (ec && i - 1 < ec.length) {
-            ec.splice(i - 1, 1)
-          }
-          changed = true
-          break // restart scan since indices shifted
-        }
-      }
-    }
-  }
-
-  private segmentsIntersect(
-    a1x: number, a1y: number, a2x: number, a2y: number,
-    b1x: number, b1y: number, b2x: number, b2y: number,
-  ): boolean {
-    const d1x = a2x - a1x, d1y = a2y - a1y
-    const d2x = b2x - b1x, d2y = b2y - b1y
-    const denom = d1x * d2y - d1y * d2x
-    if (Math.abs(denom) < 1e-12) return false
-    const t = ((b1x - a1x) * d2y - (b1y - a1y) * d2x) / denom
-    const u = ((b1x - a1x) * d1y - (b1y - a1y) * d1x) / denom
-    return t > 0.01 && t < 0.99 && u > 0.01 && u < 0.99
-  }
-
-  /**
-   * gEDA-style arc insertion: for each pair of consecutive path segments,
-   * check if any obstacle vertex's clearance circle intersects the straight
-   * line. If so, insert arc points that wrap around the obstacle vertex
-   * at clearance distance.
-   */
-  private insertObstacleArcs(cdt: RawCdt, path: Point[]): Point[] {
-    if (path.length < 2) return path
-
-    const clearance = this.minTraceWidth / 2 + this.margin
-    const result: Point[] = [path[0]!]
-
-    for (let i = 0; i < path.length - 1; i++) {
-      const a = path[i]!
-      const b = path[i + 1]!
-
-      // Find the obstacle vertex closest to segment a→b that violates clearance
-      let worstVert = -1
-      let worstDist = clearance
-
-      for (let vi = 0; vi < cdt.pts.length; vi++) {
-        if (!cdt.obstacleVertices.has(vi)) continue
-        const v = cdt.pts[vi]!
-        const d = this.pointToSegmentDist(v, a, b)
-        if (d < worstDist) {
-          // Make sure the vertex is actually between a and b (not past endpoints)
-          const dx = b.x - a.x
-          const dy = b.y - a.y
-          const len2 = dx * dx + dy * dy
-          if (len2 < 1e-12) continue
-          const t = ((v.x - a.x) * dx + (v.y - a.y) * dy) / len2
-          if (t > 0.05 && t < 0.95) {
-            worstDist = d
-            worstVert = vi
-          }
-        }
-      }
-
-      if (worstVert >= 0) {
-        // Insert arc points around this obstacle vertex
-        const v = cdt.pts[worstVert]!
-        const arcPts = this.computeArcPoints(a, b, v, clearance)
-        for (const ap of arcPts) {
-          result.push(ap)
-        }
-      }
-
-      result.push(b)
-    }
-
-    return result
-  }
-
-  /**
-   * Compute arc points that route from a to b while staying clearance
-   * distance from obstacle vertex v. Returns intermediate points
-   * (not including a or b).
-   */
-  private computeArcPoints(
-    a: Point, b: Point, v: Point, clearance: number,
-  ): Point[] {
-    // Direction from v to the line a→b
-    const dx = b.x - a.x
-    const dy = b.y - a.y
-    const len = Math.hypot(dx, dy)
-    if (len < 1e-9) return []
-
-    // Perpendicular direction (which side of the line is v on?)
-    const cross = (v.x - a.x) * dy - (v.y - a.y) * dx
-    // If cross > 0, v is to the left of a→b; route goes to the right
-    const sign = cross > 0 ? -1 : 1
-
-    // Vector from v toward the line a→b, normalized
-    const vToLineX = sign * (-dy / len)
-    const vToLineY = sign * (dx / len)
-
-    // Entry tangent point: project a onto circle around v
-    const avx = a.x - v.x
-    const avy = a.y - v.y
-    const avLen = Math.hypot(avx, avy)
-
-    const bvx = b.x - v.x
-    const bvy = b.y - v.y
-    const bvLen = Math.hypot(bvx, bvy)
-
-    if (avLen < clearance * 1.1 || bvLen < clearance * 1.1) {
-      // a or b is too close to v — just push through the perpendicular
-      return [{
-        x: v.x + vToLineX * clearance,
-        y: v.y + vToLineY * clearance,
-      }]
-    }
-
-    // Angle from v to a and v to b
-    const angleA = Math.atan2(avy, avx)
-    const angleB = Math.atan2(bvy, bvx)
-
-    // Arc from entry to exit around v at clearance distance
-    // Use 2-3 intermediate points
-    let sweep = angleB - angleA
-    // Normalize sweep to go around the side away from the line
-    if (sign > 0) {
-      while (sweep > 0) sweep -= Math.PI * 2
-      while (sweep < -Math.PI * 2) sweep += Math.PI * 2
-    } else {
-      while (sweep < 0) sweep += Math.PI * 2
-      while (sweep > Math.PI * 2) sweep -= Math.PI * 2
-    }
-
-    const steps = Math.max(2, Math.ceil(Math.abs(sweep) / (Math.PI / 4)))
-    const pts: Point[] = []
-    for (let s = 1; s < steps; s++) {
-      const angle = angleA + (sweep * s) / steps
-      pts.push({
-        x: v.x + Math.cos(angle) * clearance,
-        y: v.y + Math.sin(angle) * clearance,
-      })
-    }
-
-    return pts
-  }
-
   private stepCommit() {
-    this.resolvedPaths = this.routes.map((route) => {
+    this.resolvedPaths = this.committedPaths.map((cp) => {
       const fullRoute: { x: number; y: number; z: number }[] = []
       const vias: { x: number; y: number }[] = []
-      const routeStart = route.path[0]!
-      const routeEnd = route.path[route.path.length - 1]!
 
-      if (route.needsStartVia) {
-        fullRoute.push({ x: route.originalStart.x, y: route.originalStart.y, z: route.startLayerZ })
-        fullRoute.push({ x: routeStart.x, y: routeStart.y, z: route.startLayerZ })
-        vias.push({ x: routeStart.x, y: routeStart.y })
+      const needStartVia = cp.startLayerZ !== cp.layerZ
+      const needEndVia = cp.endLayerZ !== cp.layerZ
+
+      // Start bridge
+      if (needStartVia) {
+        fullRoute.push({ x: cp.originalStart.x, y: cp.originalStart.y, z: cp.startLayerZ })
+        fullRoute.push({ x: cp.vertices[0]!.x, y: cp.vertices[0]!.y, z: cp.startLayerZ })
+        vias.push({ x: cp.vertices[0]!.x, y: cp.vertices[0]!.y })
       } else {
-        fullRoute.push({ x: route.originalStart.x, y: route.originalStart.y, z: route.routeLayerZ })
+        fullRoute.push({ x: cp.originalStart.x, y: cp.originalStart.y, z: cp.layerZ })
       }
 
-      for (const p of route.path) {
-        fullRoute.push({ x: p.x, y: p.y, z: route.routeLayerZ })
+      // Main route
+      for (const rv of cp.vertices) {
+        fullRoute.push({ x: rv.x, y: rv.y, z: cp.layerZ })
       }
 
-      if (route.needsEndVia) {
-        vias.push({ x: routeEnd.x, y: routeEnd.y })
-        fullRoute.push({ x: routeEnd.x, y: routeEnd.y, z: route.endLayerZ })
-        fullRoute.push({ x: route.originalEnd.x, y: route.originalEnd.y, z: route.endLayerZ })
+      // End bridge
+      if (needEndVia) {
+        const last = cp.vertices[cp.vertices.length - 1]!
+        vias.push({ x: last.x, y: last.y })
+        fullRoute.push({ x: last.x, y: last.y, z: cp.endLayerZ })
+        fullRoute.push({ x: cp.originalEnd.x, y: cp.originalEnd.y, z: cp.endLayerZ })
       } else {
-        fullRoute.push({ x: route.originalEnd.x, y: route.originalEnd.y, z: route.routeLayerZ })
+        fullRoute.push({ x: cp.originalEnd.x, y: cp.originalEnd.y, z: cp.layerZ })
       }
 
-      return { connectionName: route.connectionName, route: fullRoute, vias }
+      return { connectionName: cp.name, route: fullRoute, vias }
     })
 
-    const routedSet = new Set(this.routes.map((r) => r.connectionName))
+    const routedSet = new Set(this.committedPaths.map((p) => p.name))
     this.validationResult = {
       totalConnections: this.connections.length,
       routedConnections: routedSet.size,
-      unroutedConnections: this.connections
-        .filter((c) => !routedSet.has(c.name))
-        .map((c) => c.name),
+      unroutedConnections: this.connections.filter((c) => !routedSet.has(c.name)).map((c) => c.name),
       crossNetCrossings: [],
     }
 
@@ -1265,92 +775,48 @@ export class TopologicalPathSolver extends BaseSolver {
     this.solved = true
   }
 
-  private pathLength(path: Point[]): number {
-    let len = 0
-    for (let i = 1; i < path.length; i++) {
-      len += distance(path[i - 1]!, path[i]!)
-    }
-    return len
-  }
+  // ===== PUBLIC API =====
 
-  getResolvedPaths(): ResolvedPath[] {
-    return this.resolvedPaths
-  }
-
-  getEffectiveLayerCount(): number {
-    return this.layerCount
-  }
-
-  getValidationResult() {
-    return this.validationResult
-  }
+  getResolvedPaths(): ResolvedPath[] { return this.resolvedPaths }
+  getEffectiveLayerCount(): number { return this.layerCount }
+  getValidationResult() { return this.validationResult }
 
   visualize(): GraphicsObject {
     const lines: Line[] = []
 
-    // Draw CDT edges (faint) for the first layer
+    // CDT edges
     const cdt = this.cdts[0]
     if (cdt) {
       for (const edge of cdt.edges) {
-        const p0 = cdt.pts[edge.v0]!
-        const p1 = cdt.pts[edge.v1]!
         lines.push({
-          points: [p0, p1],
-          strokeColor: edge.isConstraint
-            ? "rgba(255,0,0,0.15)"
-            : "rgba(128,128,128,0.08)",
+          points: [cdt.pts[edge.v0]!, cdt.pts[edge.v1]!],
+          strokeColor: edge.isConstraint ? "rgba(255,0,0,0.15)" : "rgba(128,128,128,0.06)",
         })
       }
     }
 
-    // Draw routes
-    for (const route of this.routes) {
-      if (route.path.length > 1) {
-        const color = this.colorMap[route.connectionName] ?? "green"
+    // Routes
+    for (const cp of this.committedPaths) {
+      if (cp.vertices.length > 1) {
         lines.push({
-          points: route.path.map((p) => ({ x: p.x, y: p.y })),
-          strokeColor: color,
+          points: cp.vertices.map((v) => ({ x: v.x, y: v.y })),
+          strokeColor: this.colorMap[cp.name] ?? "green",
           strokeWidth: this.minTraceWidth,
         })
       }
     }
 
-    // Draw obstacles
     const rects = (this.srj.obstacles ?? []).map((o) => ({
-      center: o.center,
-      width: o.width,
-      height: o.height,
-      fill: o.layers?.includes("top")
-        ? "rgba(255,0,0,0.15)"
-        : "rgba(0,0,255,0.15)",
+      center: o.center, width: o.width, height: o.height,
+      fill: o.layers?.includes("top") ? "rgba(255,0,0,0.15)" : "rgba(0,0,255,0.15)",
     }))
 
     const { minX, maxX, minY, maxY } = this.srj.bounds
     lines.push({
-      points: [
-        { x: minX, y: minY },
-        { x: maxX, y: minY },
-        { x: maxX, y: maxY },
-        { x: minX, y: maxY },
-        { x: minX, y: minY },
-      ],
+      points: [{ x: minX, y: minY }, { x: maxX, y: minY }, { x: maxX, y: maxY }, { x: minX, y: maxY }, { x: minX, y: minY }],
       strokeColor: "rgba(255,0,0,0.25)",
     })
 
     return { lines, rects }
   }
-}
-
-interface TopoRouteState {
-  connectionName: string
-  path: Point[]
-  routeLayerZ: number
-  originalStart: Point
-  originalEnd: Point
-  start: Point
-  end: Point
-  startLayerZ: number
-  endLayerZ: number
-  needsStartVia: boolean
-  needsEndVia: boolean
 }
