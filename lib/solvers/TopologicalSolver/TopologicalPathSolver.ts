@@ -893,9 +893,22 @@ export class TopologicalPathSolver extends BaseSolver {
   private stepBuildCdt() {
     this.cdts = []
     this.edgeRoutingLists = []
+
+    // gEDA inserts pad/pin CENTERS as CDT vertices (not just corners).
+    // This creates finer triangulation near routing targets.
+    // We add obstacle centers + connection endpoints as Steiner points.
+    const steinerPoints: Point[] = []
+    for (const obs of this.srj.obstacles) {
+      steinerPoints.push({ x: obs.center.x, y: obs.center.y })
+    }
+    for (const conn of this.connections) {
+      steinerPoints.push(conn.start)
+      steinerPoints.push(conn.end)
+    }
+
     for (let z = 0; z < this.layerCount; z++) {
       const merged = mergeOverlappingRects(this.baseObstaclePolygons[z]?.slice() ?? [])
-      this.cdts.push(buildRawCdt(this.srj.bounds, merged))
+      this.cdts.push(buildRawCdt(this.srj.bounds, merged, steinerPoints))
       this.edgeRoutingLists.push(new Map())
     }
     this.phase = "route"

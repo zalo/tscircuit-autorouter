@@ -405,8 +405,10 @@ export function rubberbandSegment(
       if (t2.kind === "point") calculateTermToArc(t2.x, t2.y, altArc, 1)
       else if (calculateArcToArc(altArc, t2.arc)) continue
       if (!checkArcForLoops(t1, altArc, t2)) {
+        
         const left = rubberbandSegment(cdt, path, pathStart, alt.pathIdx, t1, { kind: "arc", arc: altArc }, margin, traceWidth)
         const right = rubberbandSegment(cdt, path, alt.pathIdx + 1, pathEnd, { kind: "arc", arc: altArc }, t2, margin, traceWidth)
+        
         return [...left, altArc, ...right]
       }
     }
@@ -414,6 +416,7 @@ export function rubberbandSegment(
   }
 
   // Recurse on sub-segments
+  
   const leftArcs = rubberbandSegment(
     cdt, path, pathStart, best.pathIdx,
     t1, { kind: "arc", arc: newArc },
@@ -424,6 +427,7 @@ export function rubberbandSegment(
     { kind: "arc", arc: newArc }, t2,
     margin, traceWidth,
   )
+  
 
   return [...leftArcs, newArc, ...rightArcs]
 }

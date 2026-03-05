@@ -99,6 +99,7 @@ function pointInPolygon(px: number, py: number, poly: Point[]): boolean {
 export function buildRawCdt(
   bounds: { minX: number; maxX: number; minY: number; maxY: number },
   obstaclePolygons: Point[][],
+  steinerPoints?: Point[],
 ): RawCdt | null {
   const pts: [number, number][] = []
   const constraintEdges: [number, number][] = []
@@ -193,6 +194,25 @@ export function buildRawCdt(
 
   // --- Resolve crossings and run CDT ---
   const ringBoundaries: number[] = [] // not used by our resolver path
+  // --- Steiner points (connection endpoints, obstacle centers, etc.) ---
+  // These refine the CDT without adding constraints, creating finer
+  // triangulation near routing targets (like gEDA's pin/pad vertices).
+  if (steinerPoints) {
+    for (const sp of steinerPoints) {
+      // Don't add if too close to existing point
+      let tooClose = false
+      for (const [px, py] of pts) {
+        if (Math.abs(sp.x - px) < 1e-6 && Math.abs(sp.y - py) < 1e-6) {
+          tooClose = true
+          break
+        }
+      }
+      if (!tooClose) {
+        pts.push([sp.x, sp.y])
+      }
+    }
+  }
+
   const resolved = resolveConstraintCrossings(pts, constraintEdges, ringBoundaries)
 
   let triangles: [number, number, number][]
