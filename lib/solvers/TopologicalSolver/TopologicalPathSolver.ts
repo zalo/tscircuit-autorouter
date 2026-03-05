@@ -77,9 +77,11 @@ export class TopologicalPathSolver extends BaseSolver {
   }> = []
 
   private resolvedPaths: ResolvedPath[] = []
-  private phase: "build-cdt" | "route" | "roar" | "space" | "rubberband" | "commit" | "done" = "build-cdt"
+  private phase: "build-cdt" | "order" | "route" | "roar" | "space" | "rubberband" | "commit" | "done" = "build-cdt"
   private failedConnections: (typeof this.connections)[0][] = []
   private roarPassCount = 0
+  /** Per-connection isolated routing score (for net ordering) */
+  private connectionScores = new Map<string, number>()
   private routeIndex = 0
   private layerNameToZ = new Map<string, number>()
 
@@ -1228,6 +1230,7 @@ export class TopologicalPathSolver extends BaseSolver {
   _step() {
     switch (this.phase) {
       case "build-cdt": this.stepBuildCdt(); break
+      case "order": this.stepOrderNets(); break
       case "route": this.stepRoute(); break
       case "roar": this.stepRoar(); break
       case "space": this.stepSpace(); break
@@ -1258,6 +1261,136 @@ export class TopologicalPathSolver extends BaseSolver {
       this.cdts.push(buildRawCdt(this.srj.bounds, merged, steinerPoints))
       this.edgeRoutingLists.push(new Map())
     }
+    this.phase = "order"
+    this.routeIndex = 0
+  }
+
+  /**
+   * Port of gEDA order_nets_preroute_greedy():
+   * Route each net in isolation to get its base score, then sort by
+   * pairwise detour cost. Nets that cause the least conflict go first.
+   */
+  private stepOrderNets() {
+    // Phase 1: Route each connection in isolation to get its base score
+    for (const conn of this.connections) {
+      const preferredLayer = conn.startLayerZ
+      for (const lz of [preferredLayer, preferredLayer === 0 ? 1 : 0]) {
+        if (lz >= this.layerCount) continue
+        const cdt = this.cdts[lz]
+        if (!cdt) continue
+        const path = this.routeConnection(cdt, lz, conn)
+        if (path) {
+          // Score = path length
+          let score = 0
+          for (let i = 1; i < path.length; i++) {
+            score += distance(path[i - 1]!, path[i]!)
+          }
+          this.connectionScores.set(conn.name, score)
+          break
+        }
+      }
+      // If can't route in isolation, give infinite score
+      if (!this.connectionScores.has(conn.name)) {
+        this.connectionScores.set(conn.name, Infinity)
+      }
+    }
+
+    // Phase 2: Pairwise detour calculation (gEDA netscore_pairwise_calculation)
+    // For each net, route it in isolation, then for each other net, apply the
+    // first net's route and try routing the second — measure the detour.
+    // This is O(n²) but n is typically small (< 50 connections).
+    const pairwiseFails = new Map<string, number>()
+    const pairwiseDetour = new Map<string, number>()
+    for (const conn of this.connections) {
+      pairwiseFails.set(conn.name, 0)
+      pairwiseDetour.set(conn.name, 0)
+    }
+
+    // Sample pairwise interactions (full O(n²) for small n, sampled for large n)
+    const n = this.connections.length
+    const doFullPairwise = n <= 30
+
+    if (doFullPairwise) {
+      for (let i = 0; i < n; i++) {
+        const connA = this.connections[i]!
+        const scoreA = this.connectionScores.get(connA.name)
+        if (!isFinite(scoreA ?? Infinity)) continue
+
+        // Route connA
+        const lzA = connA.startLayerZ < this.layerCount ? connA.startLayerZ : 0
+        const cdtA = this.cdts[lzA]
+        if (!cdtA) continue
+        const pathA = this.routeConnection(cdtA, lzA, connA)
+        if (!pathA) continue
+
+        // Temporarily apply connA's route
+        this.applyRoute(connA, pathA, lzA)
+
+        // Try routing each other net with connA present
+        for (let j = 0; j < n; j++) {
+          if (i === j) continue
+          const connB = this.connections[j]!
+          const scoreB = this.connectionScores.get(connB.name)
+          if (!isFinite(scoreB ?? Infinity)) continue
+
+          let routed = false
+          for (const lz of [connB.startLayerZ, connB.startLayerZ === 0 ? 1 : 0]) {
+            if (lz >= this.layerCount) continue
+            const cdtB = this.cdts[lz]
+            if (!cdtB) continue
+            const pathB = this.routeConnection(cdtB, lz, connB)
+            if (pathB) {
+              let scoreBwithA = 0
+              for (let k = 1; k < pathB.length; k++) scoreBwithA += distance(pathB[k-1]!, pathB[k]!)
+              if (scoreBwithA > scoreB! * 1.01) {
+                pairwiseDetour.set(connA.name, (pairwiseDetour.get(connA.name) ?? 0) + scoreBwithA - scoreB!)
+              }
+              routed = true
+              break
+            }
+          }
+          if (!routed) {
+            pairwiseFails.set(connA.name, (pairwiseFails.get(connA.name) ?? 0) + 1)
+          }
+        }
+
+        // Remove connA's route
+        const cpIdx = this.committedPaths.findIndex(cp => cp.name === connA.name)
+        if (cpIdx >= 0) this.removeRoute(cpIdx)
+      }
+    }
+
+    // Phase 3: Sort by gEDA criteria: fewest pairwise fails, lowest detour sum, lowest score
+    // Use pairwise data when available, fall back to isolated score
+    this.connections.sort((a, b) => {
+      const scoreA = this.connectionScores.get(a.name) ?? Infinity
+      const scoreB = this.connectionScores.get(b.name) ?? Infinity
+
+      // Infinite scores last
+      if (!isFinite(scoreA) && !isFinite(scoreB)) return 0
+      if (isFinite(scoreA) && !isFinite(scoreB)) return -1
+      if (!isFinite(scoreA) && isFinite(scoreB)) return 1
+
+      if (doFullPairwise) {
+        const failsA = pairwiseFails.get(a.name) ?? 0
+        const failsB = pairwiseFails.get(b.name) ?? 0
+        if (failsA !== failsB) return failsA - failsB
+
+        const detourA = pairwiseDetour.get(a.name) ?? 0
+        const detourB = pairwiseDetour.get(b.name) ?? 0
+        if (Math.abs(detourA - detourB) > 0.01) return detourA - detourB
+      }
+
+      return scoreA - scoreB
+    })
+
+    // Clean up: ensure edge routing lists and committed paths are empty
+    // after the ordering phase (ordering only used routes temporarily)
+    this.committedPaths = []
+    for (let z = 0; z < this.layerCount; z++) {
+      this.edgeRoutingLists[z] = new Map()
+    }
+
     this.phase = "route"
     this.routeIndex = 0
   }
