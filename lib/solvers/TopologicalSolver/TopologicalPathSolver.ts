@@ -453,6 +453,9 @@ export class TopologicalPathSolver extends BaseSolver {
         const candKey = posKey(cand)
         if (closed.has(candKey)) continue
 
+        // Check if segment cur→cand would overlap any existing route
+        if (this.segmentOverlapsExistingRoute(layerZ, cur, cand, conn.name)) continue
+
         const g = cur.gcost + distance(cur, cand)
         const h = distance(cand, destVertex)
 
@@ -479,6 +482,51 @@ export class TopologicalPathSolver extends BaseSolver {
       console.warn(`TopologicalPathSolver: A* exhausted 20000 iterations for ${conn.name}, open=${open.length} closed=${closed.size}`)
     }
     return null
+  }
+
+  /**
+   * Check if adding a path segment from a→b would overlap any existing
+   * committed route on the same layer. Returns true if overlap detected.
+   */
+  private segmentOverlapsExistingRoute(
+    layerZ: number,
+    a: Point,
+    b: Point,
+    connectionName: string,
+  ): boolean {
+    const minDist = this.minTraceWidth
+    const baseNet = TopologicalPathSolver.baseNetName(connectionName)
+
+    for (const cp of this.committedPaths) {
+      if (cp.layerZ !== layerZ) continue
+      if (TopologicalPathSolver.baseNetName(cp.name) === baseNet) continue
+
+      const verts = cp.vertices
+      for (let i = 0; i < verts.length - 1; i++) {
+        const c = verts[i]!, d = verts[i + 1]!
+        const dist = this.segSegMinDist(a.x, a.y, b.x, b.y, c.x, c.y, d.x, d.y)
+        if (dist < minDist) return true
+      }
+    }
+    return false
+  }
+
+  private segSegMinDist(
+    a1x: number, a1y: number, a2x: number, a2y: number,
+    b1x: number, b1y: number, b2x: number, b2y: number,
+  ): number {
+    const ptSeg = (px: number, py: number, sx: number, sy: number, ex: number, ey: number) => {
+      const dx = ex - sx, dy = ey - sy, len2 = dx * dx + dy * dy
+      if (len2 < 1e-12) return Math.hypot(px - sx, py - sy)
+      const t = Math.max(0, Math.min(1, ((px - sx) * dx + (py - sy) * dy) / len2))
+      return Math.hypot(px - (sx + t * dx), py - (sy + t * dy))
+    }
+    return Math.min(
+      ptSeg(a1x, a1y, b1x, b1y, b2x, b2y),
+      ptSeg(a2x, a2y, b1x, b1y, b2x, b2y),
+      ptSeg(b1x, b1y, a1x, a1y, a2x, a2y),
+      ptSeg(b2x, b2y, a1x, a1y, a2x, a2y),
+    )
   }
 
   /**
