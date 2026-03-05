@@ -58,6 +58,30 @@ function dist(x0: number, y0: number, x1: number, y1: number): number {
   return Math.hypot(x1 - x0, y1 - y0)
 }
 
+/** Do segments (a1,a2) and (b1,b2) properly intersect? (not just touch) */
+function coordIntersectProp(
+  a1x: number, a1y: number, a2x: number, a2y: number,
+  b1x: number, b1y: number, b2x: number, b2y: number,
+): boolean {
+  const d1x = a2x - a1x, d1y = a2y - a1y
+  const d2x = b2x - b1x, d2y = b2y - b1y
+  const denom = d1x * d2y - d1y * d2x
+  if (Math.abs(denom) < 1e-12) return false
+  const t = ((b1x - a1x) * d2y - (b1y - a1y) * d2x) / denom
+  const u = ((b1x - a1x) * d1y - (b1y - a1y) * d1x) / denom
+  return t > 0.01 && t < 0.99 && u > 0.01 && u < 0.99
+}
+
+/**
+ * Check if an arc creates a loop. Port of gEDA check_arc_for_loops().
+ * Returns true if the line from t1_exit → arc_entry crosses arc_exit → t2_entry.
+ */
+function checkArcForLoops(t1: Terminal, arc: TopoArc, t2: Terminal): boolean {
+  const [x0, y0] = termExitXY(t1)
+  const [x1, y1] = termEntryXY(t2)
+  return coordIntersectProp(x0, y0, arc.x0, arc.y0, arc.x1, arc.y1, x1, y1)
+}
+
 /**
  * Check if an obstacle vertex's clearance circle INTERSECTS the line segment.
  * The edge is "cutting through" the segment (endpoints on opposite sides).
@@ -364,6 +388,29 @@ export function rubberbandSegment(
     calculateTermToArc(t2.x, t2.y, newArc, 1)
   } else {
     if (calculateArcToArc(newArc, t2.arc)) return [] // degenerate
+  }
+
+  // gEDA check_arc_for_loops: if the line t1_exit→arc_entry crosses
+  // arc_exit→t2_entry, the arc creates a loop — skip it
+  if (checkArcForLoops(t1, newArc, t2)) {
+    // Try next-best candidate
+    for (let ci = 1; ci < candidates.length; ci++) {
+      const alt = candidates[ci]!
+      const altArc: TopoArc = {
+        centre: alt.arcv, r: alt.r, dir: alt.arcWind || 1,
+        x0: 0, y0: 0, x1: 0, y1: 0,
+      }
+      if (t1.kind === "point") calculateTermToArc(t1.x, t1.y, altArc, 0)
+      else if (calculateArcToArc(t1.arc, altArc)) continue
+      if (t2.kind === "point") calculateTermToArc(t2.x, t2.y, altArc, 1)
+      else if (calculateArcToArc(altArc, t2.arc)) continue
+      if (!checkArcForLoops(t1, altArc, t2)) {
+        const left = rubberbandSegment(cdt, path, pathStart, alt.pathIdx, t1, { kind: "arc", arc: altArc }, margin, traceWidth)
+        const right = rubberbandSegment(cdt, path, alt.pathIdx + 1, pathEnd, { kind: "arc", arc: altArc }, t2, margin, traceWidth)
+        return [...left, altArc, ...right]
+      }
+    }
+    return [] // All candidates create loops
   }
 
   // Recurse on sub-segments

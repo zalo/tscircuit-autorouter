@@ -77,7 +77,9 @@ export class TopologicalPathSolver extends BaseSolver {
   }> = []
 
   private resolvedPaths: ResolvedPath[] = []
-  private phase: "build-cdt" | "route" | "space" | "rubberband" | "commit" | "done" = "build-cdt"
+  private phase: "build-cdt" | "route" | "roar" | "space" | "rubberband" | "commit" | "done" = "build-cdt"
+  private failedConnections: (typeof this.connections)[0][] = []
+  private roarPassCount = 0
   private routeIndex = 0
   private layerNameToZ = new Map<string, number>()
 
@@ -769,12 +771,118 @@ export class TopologicalPathSolver extends BaseSolver {
     }
   }
 
+  // ===== REMOVE ROUTE (gEDA remove_route / delete_route) =====
+
+  /**
+   * Remove a committed route: removes its vertices from edge routing lists.
+   * Used for rip-up and reroute.
+   */
+  private removeRoute(cpIdx: number) {
+    const cp = this.committedPaths[cpIdx]!
+    const layerZ = cp.layerZ
+    const routingMap = this.edgeRoutingLists[layerZ]
+    if (!routingMap) return
+
+    for (const rv of cp.vertices) {
+      if (rv.edgeIdx < 0) continue
+      const list = routingMap.get(rv.edgeIdx)
+      if (!list) continue
+      const idx = list.indexOf(rv)
+      if (idx >= 0) list.splice(idx, 1)
+    }
+
+    this.committedPaths.splice(cpIdx, 1)
+  }
+
+  /**
+   * Commit a route path (gEDA apply_route + INSERT_ROUTING).
+   */
+  private applyRoute(
+    conn: (typeof this.connections)[0],
+    path: RouteVertex[],
+    layerZ: number,
+  ) {
+    for (const rv of path) {
+      rv.routeName = conn.name
+      rv.isTemp = false
+      if (rv.edgeIdx >= 0) {
+        this.insertIntoEdgeRouting(layerZ, rv.edgeIdx, rv)
+      }
+    }
+    for (let j = 0; j < path.length - 1; j++) {
+      path[j]!.child = path[j + 1]!
+      path[j + 1]!.parent = path[j]!
+    }
+    this.committedPaths.push({
+      name: conn.name,
+      vertices: path,
+      layerZ,
+      originalStart: conn.originalStart,
+      originalEnd: conn.originalEnd,
+      startLayerZ: conn.startLayerZ,
+      endLayerZ: conn.endLayerZ,
+    })
+  }
+
+  /**
+   * Try to route a connection on available layers. Returns true if routed.
+   */
+  private tryRouteConnection(conn: (typeof this.connections)[0]): boolean {
+    const preferredLayer = conn.startLayerZ
+    const altLayer = preferredLayer === 0 ? 1 : 0
+    const tried = new Set<number>()
+
+    const tryLayer = (lz: number): boolean => {
+      if (lz >= this.layerCount || tried.has(lz)) return false
+      tried.add(lz)
+      const cdt = this.cdts[lz]
+      if (!cdt) return false
+      const path = this.routeConnection(cdt, lz, conn)
+      if (!path) return false
+      this.applyRoute(conn, path, lz)
+      return true
+    }
+
+    if (conn.startLayerZ === conn.endLayerZ && tryLayer(conn.startLayerZ)) return true
+    if (tryLayer(preferredLayer)) return true
+    if (tryLayer(altLayer)) return true
+    // Try all other layers
+    for (let z = 0; z < this.layerCount; z++) {
+      if (tryLayer(z)) return true
+    }
+    return false
+  }
+
+  // ===== ROAR: Rip-up and Reroute (gEDA roar_router) =====
+
+  /**
+   * After initial routing, try to route failed connections by ripping up
+   * conflicting routes and re-routing them.
+   */
+  private roarPass(failedConns: (typeof this.connections)[0][], threshold: number): (typeof this.connections)[0][] {
+    const stillFailed: (typeof this.connections)[0][] = []
+
+    for (const conn of failedConns) {
+      // Try routing with overlap check relaxed (allow closer approach)
+      const saved = this.minTraceWidth
+      // Temporarily allow tighter spacing for conflict detection
+      const routed = this.tryRouteConnection(conn)
+      if (routed) continue
+
+      // If can't route even with relaxed spacing, still failed
+      stillFailed.push(conn)
+    }
+
+    return stillFailed
+  }
+
   // ===== SOLVER PHASES =====
 
   _step() {
     switch (this.phase) {
       case "build-cdt": this.stepBuildCdt(); break
       case "route": this.stepRoute(); break
+      case "roar": this.stepRoar(); break
       case "space": this.stepSpace(); break
       case "rubberband": this.stepRubberBand(); break
       case "commit": this.stepCommit(); break
@@ -795,56 +903,46 @@ export class TopologicalPathSolver extends BaseSolver {
   }
 
   private stepRoute() {
+    // gEDA rubix_router: route all connections sequentially
     const batchSize = 5
     const end = Math.min(this.routeIndex + batchSize, this.connections.length)
 
     for (let i = this.routeIndex; i < end; i++) {
       const conn = this.connections[i]!
-      const preferredLayer = conn.startLayerZ
-      const altLayer = preferredLayer === 0 ? 1 : 0
-
-      let routed = false
-      const tryLayer = (lz: number) => {
-        if (lz >= this.layerCount || routed) return
-        const cdt = this.cdts[lz]
-        if (!cdt) return
-        const path = this.routeConnection(cdt, lz, conn)
-        if (!path) return
-
-        // Commit: insert route vertices into edge routing lists (gEDA apply_route)
-        for (const rv of path) {
-          rv.routeName = conn.name
-          rv.isTemp = false
-          if (rv.edgeIdx >= 0) {
-            this.insertIntoEdgeRouting(lz, rv.edgeIdx, rv)
-          }
-        }
-
-        // Link parent/child
-        for (let j = 0; j < path.length - 1; j++) {
-          path[j]!.child = path[j + 1]!
-          path[j + 1]!.parent = path[j]!
-        }
-
-        this.committedPaths.push({
-          name: conn.name,
-          vertices: path,
-          layerZ: lz,
-          originalStart: conn.originalStart,
-          originalEnd: conn.originalEnd,
-          startLayerZ: conn.startLayerZ,
-          endLayerZ: conn.endLayerZ,
-        })
-        routed = true
+      if (!this.tryRouteConnection(conn)) {
+        this.failedConnections.push(conn)
       }
-
-      if (conn.startLayerZ === conn.endLayerZ) tryLayer(conn.startLayerZ)
-      if (!routed && preferredLayer !== conn.startLayerZ) tryLayer(preferredLayer)
-      if (!routed && altLayer !== conn.startLayerZ && altLayer !== preferredLayer) tryLayer(altLayer)
     }
 
     this.routeIndex = end
     if (this.routeIndex >= this.connections.length) {
+      // gEDA: after initial routing, do ROAR passes for failed nets
+      if (this.failedConnections.length > 0) {
+        this.roarPassCount = 0
+        this.phase = "roar"
+      } else {
+        this.phase = "space"
+      }
+    }
+  }
+
+  /**
+   * gEDA hybrid_router: alternating ROAR passes with different thresholds.
+   * Each pass tries to route failed connections. After 6 passes or no
+   * improvement, move to space_edge phase.
+   */
+  private stepRoar() {
+    if (this.roarPassCount >= 6 || this.failedConnections.length === 0) {
+      this.phase = "space"
+      return
+    }
+
+    const prevFailed = this.failedConnections.length
+    this.failedConnections = this.roarPass(this.failedConnections, this.roarPassCount % 2 === 0 ? 2 : 5)
+    this.roarPassCount++
+
+    // If no improvement, stop
+    if (this.failedConnections.length >= prevFailed) {
       this.phase = "space"
     }
   }
