@@ -100,13 +100,12 @@ export class TopologicalPathSolver extends BaseSolver {
     this.minTraceWidth = params.minTraceWidth ?? params.srj.minTraceWidth
     this.margin = params.margin ?? params.srj.defaultObstacleMargin ?? this.minTraceWidth
     this.viaDiameter = params.srj.minViaDiameter ?? 0.6
-    this.maxLayerCount = Math.max(1, params.srj.layerCount ?? 2)
+    const allLayerNames = this.getAllLayerNames()
+    this.maxLayerCount = Math.max(params.srj.layerCount ?? 2, allLayerNames.length)
     this.layerCount = this.maxLayerCount
 
     const connMap = getConnectivityMapFromSimpleRouteJson(params.srj)
     this.colorMap = params.colorMap ?? getColorMap(params.srj, connMap)
-
-    const allLayerNames = this.getAllLayerNames()
     for (let z = 0; z < allLayerNames.length; z++) {
       this.layerNameToZ.set(allLayerNames[z]!, z)
     }
