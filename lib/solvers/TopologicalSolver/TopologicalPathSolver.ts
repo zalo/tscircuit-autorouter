@@ -731,7 +731,19 @@ export class TopologicalPathSolver extends BaseSolver {
   }
 
   private stepRubberBand() {
-    // gEDA: oproute_rubberband() for each route after space_edge
+    // Collect constraint segments for simplification
+    const constraintSegsPerLayer: Map<number, { x1: number; y1: number; x2: number; y2: number }[]> = new Map()
+    for (let z = 0; z < this.layerCount; z++) {
+      const cdt = this.cdts[z]
+      if (!cdt) continue
+      const segs: { x1: number; y1: number; x2: number; y2: number }[] = []
+      for (const edge of cdt.edges) {
+        if (!edge.isConstraint) continue
+        segs.push({ x1: cdt.pts[edge.v0]!.x, y1: cdt.pts[edge.v0]!.y, x2: cdt.pts[edge.v1]!.x, y2: cdt.pts[edge.v1]!.y })
+      }
+      constraintSegsPerLayer.set(z, segs)
+    }
+
     for (const cp of this.committedPaths) {
       const cdt = this.cdts[cp.layerZ]
       if (!cdt) continue
@@ -740,52 +752,98 @@ export class TopologicalPathSolver extends BaseSolver {
       const start = cp.vertices[0]!
       const end = cp.vertices[cp.vertices.length - 1]!
 
+      // Step 1: Rubber-band — create arcs around obstacle vertices
       const arcs = rubberbandSegment(
         cdt,
         cp.vertices,
-        1, // skip start terminal
-        cp.vertices.length - 1, // skip end terminal
+        1,
+        cp.vertices.length - 1,
         { kind: "point", x: start.x, y: start.y },
         { kind: "point", x: end.x, y: end.y },
         this.margin,
         this.minTraceWidth,
       )
 
+      // Step 2: Convert to geometric path (arcs + straight connections)
+      let smoothPath: Point[]
       if (arcs.length > 0) {
-        // Convert arcs to geometric path points
-        const smoothPath = arcsToPath(
+        smoothPath = arcsToPath(
           { x: start.x, y: start.y },
           { x: end.x, y: end.y },
           arcs,
         )
-
-        // Replace vertex positions with the smooth path
-        // Keep the original RouteVertex objects but update coordinates
-        // Create new simplified vertex list from the smooth path
-        const newVertices = smoothPath.map((p, i) => {
-          if (i === 0) return cp.vertices[0]! // keep start
-          if (i === smoothPath.length - 1) return cp.vertices[cp.vertices.length - 1]! // keep end
-          // Create intermediate vertices (not on edges anymore — they're arc points)
-          return {
-            x: p.x,
-            y: p.y,
-            edgeIdx: -1,
-            t: -1,
-            isTemp: false,
-            parent: null,
-            child: null,
-            gcost: 0,
-            hcost: 0,
-            routeName: cp.name,
-            thickness: this.minTraceWidth,
-          }
-        })
-
-        cp.vertices = newVertices
+      } else {
+        // No arcs needed — keep original path for now
+        smoothPath = cp.vertices.map((v) => ({ x: v.x, y: v.y }))
       }
+
+      // Note: path simplification (removing CDT-edge crossing points where
+      // prev→next doesn't cross constraints) is NOT done here. It causes
+      // traces to cut through obstacles because the constraint-intersection
+      // test has false negatives from floating point issues. The CDT-edge
+      // zigzag is the topologically correct path; gEDA smooths it with arcs.
+
+      // Step 4: Replace vertices
+      const newVertices = smoothPath.map((p, i) => {
+        if (i === 0) return cp.vertices[0]!
+        if (i === smoothPath.length - 1) return cp.vertices[cp.vertices.length - 1]!
+        return {
+          x: p.x, y: p.y,
+          edgeIdx: -1, t: -1,
+          isTemp: false, parent: null, child: null,
+          gcost: 0, hcost: 0,
+          routeName: cp.name, thickness: this.minTraceWidth,
+        } as RouteVertex
+      })
+
+      cp.vertices = newVertices
     }
 
     this.phase = "commit"
+  }
+
+  /**
+   * Iteratively remove points from a path where the straight line
+   * from prev→next doesn't cross any constraint edge.
+   */
+  private simplifyPointPath(
+    path: Point[],
+    constraintSegs: { x1: number; y1: number; x2: number; y2: number }[],
+  ): Point[] {
+    const result = [...path]
+    let changed = true
+    while (changed) {
+      changed = false
+      for (let i = 1; i < result.length - 1; i++) {
+        const prev = result[i - 1]!, next = result[i + 1]!
+        let crosses = false
+        for (const cs of constraintSegs) {
+          if (this.segsIntersect(prev.x, prev.y, next.x, next.y, cs.x1, cs.y1, cs.x2, cs.y2)) {
+            crosses = true
+            break
+          }
+        }
+        if (!crosses) {
+          result.splice(i, 1)
+          changed = true
+          break
+        }
+      }
+    }
+    return result
+  }
+
+  private segsIntersect(
+    a1x: number, a1y: number, a2x: number, a2y: number,
+    b1x: number, b1y: number, b2x: number, b2y: number,
+  ): boolean {
+    const d1x = a2x - a1x, d1y = a2y - a1y
+    const d2x = b2x - b1x, d2y = b2y - b1y
+    const denom = d1x * d2y - d1y * d2x
+    if (Math.abs(denom) < 1e-12) return false
+    const t = ((b1x - a1x) * d2y - (b1y - a1y) * d2x) / denom
+    const u = ((b1x - a1x) * d1y - (b1y - a1y) * d1x) / denom
+    return t > 0.01 && t < 0.99 && u > 0.01 && u < 0.99
   }
 
   private stepCommit() {
