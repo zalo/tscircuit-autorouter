@@ -2275,36 +2275,71 @@ export class GreedySequentialPathSolver extends BaseSolver {
       }
     }
 
-    // Draw trace obstacle polygon outlines
+    // Draw convex region map (layer 0): filled polygons colored by state
+    const mesh = this.meshes[0]
+    if (mesh) {
+      const rects: GraphicsObject["rects"] = []
+      for (let pi = 0; pi < mesh.polygons.length; pi++) {
+        const polygon = mesh.polygons[pi]!
+        if (polygon.vertices.length < 3) continue
+
+        // Compute AABB for the rect visualization
+        let minPx = Infinity
+        let minPy = Infinity
+        let maxPx = -Infinity
+        let maxPy = -Infinity
+        const polyPts: { x: number; y: number }[] = []
+        for (const vIdx of polygon.vertices) {
+          const v = mesh.vertices[vIdx]
+          if (!v) continue
+          polyPts.push({ x: v.p.x, y: v.p.y })
+          if (v.p.x < minPx) minPx = v.p.x
+          if (v.p.y < minPy) minPy = v.p.y
+          if (v.p.x > maxPx) maxPx = v.p.x
+          if (v.p.y > maxPy) maxPy = v.p.y
+        }
+
+        // Draw polygon outline with color based on state
+        const isBlocked = polygon.blocked
+        const isObstacle = polygon.obstacleIndex >= 0
+
+        // Color: blocked obstacles = red fill, free space = faint blue,
+        // unblocked obstacles = green (shouldn't normally appear during viz)
+        const fillColor = isBlocked
+          ? "rgba(255,60,60,0.15)"
+          : isObstacle
+            ? "rgba(60,255,60,0.1)"
+            : "rgba(80,120,255,0.04)"
+
+        const strokeColor = isBlocked
+          ? "rgba(255,80,80,0.5)"
+          : isObstacle
+            ? "rgba(60,200,60,0.3)"
+            : "rgba(100,100,255,0.2)"
+
+        // Draw as closed polyline (more accurate than rect for non-axis-aligned)
+        if (polyPts.length >= 3) {
+          const closedPts = [...polyPts, { ...polyPts[0]! }]
+          lines.push({
+            points: closedPts,
+            strokeColor,
+            strokeWidth: isBlocked ? 0.06 : 0.02,
+          })
+        }
+      }
+    }
+
+    // Draw trace obstacle polygon outlines (thicker, on top)
     for (const tp of this.traceObstaclePolys) {
       const color = this.colorMap[tp.connectionName] ?? "green"
-      const alpha = tp.layerZ === 0 ? 0.4 : 0.2
+      const alpha = tp.layerZ === 0 ? 0.6 : 0.3
       if (tp.polygon.length >= 3) {
         const pts = tp.polygon.map((p) => ({ x: p.x, y: p.y }))
         pts.push({ ...pts[0]! }) // close the polygon
         lines.push({
           points: pts,
           strokeColor: this.withAlpha(color, alpha),
-          strokeWidth: 0.02,
-        })
-      }
-    }
-
-    // Draw mesh edges (layer 0 only for clarity)
-    const mesh = this.meshes[0]
-    if (mesh) {
-      for (const polygon of mesh.polygons) {
-        if (polygon.vertices.length < 2) continue
-        const pts: { x: number; y: number }[] = []
-        for (const vIdx of polygon.vertices) {
-          const v = mesh.vertices[vIdx]
-          if (v) pts.push({ x: v.p.x, y: v.p.y })
-        }
-        if (pts.length > 0) pts.push({ ...pts[0]! })
-        lines.push({
-          points: pts,
-          strokeColor: "rgba(100,100,255,0.4)",
-          strokeWidth: 0.03,
+          strokeWidth: 0.05,
         })
       }
     }
