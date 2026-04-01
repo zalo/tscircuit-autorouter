@@ -260,11 +260,12 @@ export class GreedySequentialPathSolver extends BaseSolver {
     // Add octagonal endpoint obstacles for every connection start/end point.
     // These ensure that pad endpoints are blocked for all OTHER traces, while
     // being excluded (via connectedTo) when routing the owning trace.
-    // Radius = 2× clearance so other traces' obstacle polygons (which extend
-    // clearance from their centerline) can't reach the pad center. This
-    // guarantees at least clearance of free escape corridor for the pad's
-    // own trace to route out.
-    const endpointClearance = (this.minTraceWidth / 2 + this.margin) * 2
+    // The octagon is the bounding octagon that fully contains a circle of
+    // radius=clearance.  For a regular octagon with circumradius R, the
+    // inradius (edge midpoint distance) = R × cos(π/8).  We need inradius ≥
+    // clearance, so R = clearance / cos(π/8) ≈ clearance × 1.0824.
+    const baseClearance = this.minTraceWidth / 2 + this.margin
+    const endpointClearance = baseClearance / Math.cos(Math.PI / 8)
     for (const conn of params.srj.connections) {
       const pts = conn.pointsToConnect
       const connNames = [conn.name]
