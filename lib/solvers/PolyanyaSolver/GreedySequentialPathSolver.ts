@@ -229,7 +229,10 @@ export class GreedySequentialPathSolver extends BaseSolver {
     this.minTraceWidth = params.minTraceWidth
     this.margin = params.margin
     this.useObstacles = params.useObstacles ?? true
-    this.useOccupancyToggle = params.useOccupancyToggle ?? true
+    // CDT exclusion is the default (correct, no crossings). Occupancy toggle
+    // is faster but has centroid-based classification imprecision that can
+    // cause trace crossings on complex boards (e.g. DIP16 crossing traces).
+    this.useOccupancyToggle = params.useOccupancyToggle ?? false
     this.usePolyanya = params.usePolyanya ?? true
     this.maxLayerCount = Math.max(1, params.srj.layerCount ?? 2)
     this.layerCount = Math.min(2, this.maxLayerCount) // Start with 2 layers for layer-aware routing
