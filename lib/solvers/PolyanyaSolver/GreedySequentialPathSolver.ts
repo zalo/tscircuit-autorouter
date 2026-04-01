@@ -260,7 +260,11 @@ export class GreedySequentialPathSolver extends BaseSolver {
     // Add octagonal endpoint obstacles for every connection start/end point.
     // These ensure that pad endpoints are blocked for all OTHER traces, while
     // being excluded (via connectedTo) when routing the owning trace.
-    const endpointClearance = this.minTraceWidth / 2 + this.margin
+    // Radius = 2× clearance so other traces' obstacle polygons (which extend
+    // clearance from their centerline) can't reach the pad center. This
+    // guarantees at least clearance of free escape corridor for the pad's
+    // own trace to route out.
+    const endpointClearance = (this.minTraceWidth / 2 + this.margin) * 2
     for (const conn of params.srj.connections) {
       const pts = conn.pointsToConnect
       const connNames = [conn.name]
@@ -1377,13 +1381,18 @@ export class GreedySequentialPathSolver extends BaseSolver {
 
       // -----------------------------------------------------------------
       // Strategy 2 (fallback): Nudge endpoints outside obstacles and route
-      // on the global mesh.  Used when direct routing fails (CDT issue,
-      // degenerate geometry) or when via transitions are needed.
+      // using a connection-specific mesh (own-net obstacles excluded).
+      // Used when direct routing fails or when via transitions are needed.
       // -----------------------------------------------------------------
       if (!foundForThis) {
         const starts =
           c.startCandidates.length > 0 ? c.startCandidates : [c.start]
         const ends = c.endCandidates.length > 0 ? c.endCandidates : [c.end]
+
+        // Use connection-specific mesh so own-net endpoint octagons and
+        // same-net trace obstacles are excluded for the nudge path too.
+        const fallbackMesh =
+          this.buildMeshExcluding(layerZ, c.connNames) ?? mesh
 
         const maxViaDrift = this.viaDiameter * 2
         for (const s of starts) {
@@ -1422,8 +1431,8 @@ export class GreedySequentialPathSolver extends BaseSolver {
               continue
 
             const r = this.usePolyanya
-              ? this.searchPolyanya(mesh, effectiveS, effectiveE)
-              : this.searchVG(mesh, layerZ, effectiveS, effectiveE)
+              ? this.searchPolyanya(fallbackMesh, effectiveS, effectiveE)
+              : this.searchVG(fallbackMesh, layerZ, effectiveS, effectiveE)
             if (r.cost < 0 || r.path.length === 0) continue
 
             const cong = c.congestionScore
