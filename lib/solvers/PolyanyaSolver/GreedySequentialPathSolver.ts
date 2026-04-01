@@ -445,6 +445,15 @@ export class GreedySequentialPathSolver extends BaseSolver {
     this.remaining = [...this.allConnections]
     this.totalConnections = this.remaining.length
     this.MAX_ITERATIONS = Math.max(500, this.totalConnections * 10)
+
+    // Rebuild endpoint obstacle mappings now that allConnections is populated.
+    // The initial buildMesh calls in the constructor ran before allConnections
+    // existed, so endpointObstacleIndices was empty.
+    if (this.useOccupancyToggle) {
+      for (let z = 0; z < this.layerCount; z++) {
+        this.rebuildEndpointMapping(z)
+      }
+    }
   }
 
   /** Layer names based on maxLayerCount (stable even as layerCount grows) */
@@ -572,20 +581,31 @@ export class GreedySequentialPathSolver extends BaseSolver {
       }
       this.connObstacleIndices[layerZ] = map
 
-      // Build endpoint → obstacle index mapping.
-      // For each obstacle in the mesh, check which connection endpoints
-      // fall inside it.  Only those specific obstacles get unblocked
-      // when routing that connection (not the entire net).
-      const epMap = new Map<string, number[]>()
-      const conns = this.allConnections ?? []
-      for (const obsIdx of mesh.getObstacleIndices()) {
-        if (obsIdx < 0 || obsIdx >= allObstacles.length) continue
-        const poly = allObstacles[obsIdx]!
-        // Check each connection's endpoints
+      this.rebuildEndpointMapping(layerZ)
+    }
+  }
+
+  /** Rebuild endpoint → obstacle index mapping for a layer.
+   *  For each obstacle polygon in the mesh, checks which connection
+   *  endpoints fall inside it so only those specific obstacles get
+   *  unblocked when routing (not the entire net). */
+  private rebuildEndpointMapping(layerZ: number): void {
+    const mesh = this.meshes[layerZ]
+    if (!mesh) return
+    const conns = this.allConnections
+    if (!conns || conns.length === 0) return
+
+    const epMap = new Map<string, number[]>()
+    for (const obsIdx of mesh.getObstacleIndices()) {
+      // Check ALL mesh polygons with this obstacleIndex (obstacle may be
+      // decomposed into multiple triangles by the CDT).
+      for (const poly of mesh.polygons) {
+        if (poly.obstacleIndex !== obsIdx) continue
+        const verts = poly.vertices.map((vi) => mesh.vertices[vi]!.p)
         for (const conn of conns) {
           if (conn.startLayerZ === layerZ) {
             const key = `${conn.originalStart.x},${conn.originalStart.y}`
-            if (this.pointInPolygon(conn.originalStart.x, conn.originalStart.y, poly)) {
+            if (this.pointInPolygon(conn.originalStart.x, conn.originalStart.y, verts)) {
               let arr = epMap.get(key)
               if (!arr) { arr = []; epMap.set(key, arr) }
               if (!arr.includes(obsIdx)) arr.push(obsIdx)
@@ -593,7 +613,7 @@ export class GreedySequentialPathSolver extends BaseSolver {
           }
           if (conn.endLayerZ === layerZ) {
             const key = `${conn.originalEnd.x},${conn.originalEnd.y}`
-            if (this.pointInPolygon(conn.originalEnd.x, conn.originalEnd.y, poly)) {
+            if (this.pointInPolygon(conn.originalEnd.x, conn.originalEnd.y, verts)) {
               let arr = epMap.get(key)
               if (!arr) { arr = []; epMap.set(key, arr) }
               if (!arr.includes(obsIdx)) arr.push(obsIdx)
@@ -601,8 +621,8 @@ export class GreedySequentialPathSolver extends BaseSolver {
           }
         }
       }
-      this.endpointObstacleIndices[layerZ] = epMap
     }
+    this.endpointObstacleIndices[layerZ] = epMap
   }
 
   /** Simple point-in-polygon test */
