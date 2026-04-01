@@ -70,6 +70,9 @@ export class GreedySequentialPathSolver extends BaseSolver {
     endCandidates: Point[]
     startLayerZ: number
     endLayerZ: number
+    /** Higher = more congested endpoints. Used as primary sort key so
+     *  traces in crowded areas get routed first while space is available. */
+    congestionScore: number
   }>
 
   /** Connections still waiting to be routed */
@@ -83,6 +86,7 @@ export class GreedySequentialPathSolver extends BaseSolver {
     endCandidates: Point[]
     startLayerZ: number
     endLayerZ: number
+    congestionScore: number
   }>
 
   /** Per-layer base obstacle polygons from original SRJ only (for resets) */
@@ -312,8 +316,50 @@ export class GreedySequentialPathSolver extends BaseSolver {
         endCandidates,
         startLayerZ,
         endLayerZ,
+        congestionScore: 0, // computed below
       }
     })
+
+    // -----------------------------------------------------------------------
+    // Congestion scoring: count how many other pad endpoints and obstacles
+    // are near each connection's endpoints.  Traces in crowded areas should
+    // be routed first while there is still space available.
+    // -----------------------------------------------------------------------
+    // Collect all pad positions (every endpoint of every connection)
+    const allPads: { x: number; y: number }[] = []
+    for (const conn of params.srj.connections) {
+      for (const pt of conn.pointsToConnect) {
+        allPads.push({ x: pt.x, y: pt.y })
+      }
+    }
+    // Also include obstacle centers as congestion contributors
+    for (const obs of params.srj.obstacles) {
+      allPads.push({ x: obs.center.x, y: obs.center.y })
+    }
+
+    // Congestion radius: nearby pads within this distance contribute.
+    // Use a multiple of the margin so the radius scales with board density.
+    const congestionRadius = Math.max(this.margin * 6, this.viaDiameter * 4)
+    const r2 = congestionRadius * congestionRadius
+
+    for (const conn of this.allConnections) {
+      let score = 0
+      const sx = conn.originalStart.x
+      const sy = conn.originalStart.y
+      const ex = conn.originalEnd.x
+      const ey = conn.originalEnd.y
+
+      for (const pad of allPads) {
+        const dxs = pad.x - sx
+        const dys = pad.y - sy
+        if (dxs * dxs + dys * dys < r2) score++
+        const dxe = pad.x - ex
+        const dye = pad.y - ey
+        if (dxe * dxe + dye * dye < r2) score++
+      }
+      // Subtract 2 for self (each endpoint counts itself)
+      conn.congestionScore = Math.max(0, score - 2)
+    }
 
     this.remaining = [...this.allConnections]
     this.totalConnections = this.remaining.length
@@ -1155,6 +1201,7 @@ export class GreedySequentialPathSolver extends BaseSolver {
     if (!mesh) return { idx: -1, path: [] }
 
     let bestIdx = -1
+    let bestCongestion = -1
     let bestCost = pickShortest ? Infinity : -Infinity
     let bestPath: Point[] = []
 
@@ -1221,9 +1268,17 @@ export class GreedySequentialPathSolver extends BaseSolver {
             : this.searchVG(mesh, layerZ, effectiveS, effectiveE)
           if (r.cost < 0 || r.path.length === 0) continue
 
-          const better = pickShortest ? r.cost < bestCost : r.cost > bestCost
-          if (better) {
+          // Primary key: congestion score (higher = more crowded → route first).
+          // Secondary key: path cost (shortest or longest depending on phase).
+          const cong = c.congestionScore
+          const betterCongestion = cong > bestCongestion
+          const sameCongestion = cong === bestCongestion
+          const betterCost = pickShortest
+            ? r.cost < bestCost
+            : r.cost > bestCost
+          if (betterCongestion || (sameCongestion && betterCost)) {
             bestIdx = i
+            bestCongestion = cong
             bestCost = r.cost
             bestPath = r.path
             bestStart = effectiveS
