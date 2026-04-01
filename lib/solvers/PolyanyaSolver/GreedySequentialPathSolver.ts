@@ -70,9 +70,9 @@ export class GreedySequentialPathSolver extends BaseSolver {
     endCandidates: Point[]
     startLayerZ: number
     endLayerZ: number
-    /** Higher = more congested endpoints. Used as primary sort key so
-     *  traces in crowded areas get routed first while space is available. */
     congestionScore: number
+    /** All names that might match an obstacle's connectedTo list */
+    connNames: string[]
   }>
 
   /** Connections still waiting to be routed */
@@ -87,6 +87,7 @@ export class GreedySequentialPathSolver extends BaseSolver {
     startLayerZ: number
     endLayerZ: number
     congestionScore: number
+    connNames: string[]
   }>
 
   /** Per-layer base obstacle polygons from original SRJ only (for resets) */
@@ -94,6 +95,16 @@ export class GreedySequentialPathSolver extends BaseSolver {
 
   /** Per-layer rect obstacle polygons (base rects + via rects, merged before CDT) */
   private rectObstacles: Point[][][] = []
+
+  /** Per-layer: connectedTo names for each base obstacle polygon (parallel to baseObstaclePolygons) */
+  private baseObstacleConnectedTo: string[][] = []
+
+  /** Per-layer: how many entries at the start of rectObstacles[z] are base obstacles */
+  private baseObstacleCount: number[] = []
+
+  /** Per-layer cache: connNames key → Mesh built with those obstacles removed.
+   *  Invalidated whenever buildMesh() is called. */
+  private connectionMeshCache: Map<string, Mesh | null>[] = []
 
   /** Per-layer trace obstacle polygons (thick polyline offsets, passed directly to CDT without merging) */
   private tracePolygonObstacles: Point[][][] = []
@@ -213,8 +224,11 @@ export class GreedySequentialPathSolver extends BaseSolver {
     }
 
     // Build per-layer base obstacle polygons for ALL possible layers upfront
-    // (so layer names remain stable when layerCount grows dynamically)
+    // (so layer names remain stable when layerCount grows dynamically).
+    // Also record which connection names each obstacle is connected to, so we
+    // can exclude them when routing their own traces.
     this.baseObstaclePolygons = []
+    this.baseObstacleConnectedTo = []
     for (let z = 0; z < this.maxLayerCount; z++) {
       const layerName = allLayerNames[z]!
       const layerObstacles = params.srj.obstacles.filter((obs) =>
@@ -229,13 +243,24 @@ export class GreedySequentialPathSolver extends BaseSolver {
           this.margin,
         ),
       )
+      const connectedToNames = layerObstacles.map((obs) =>
+        [...obs.connectedTo],
+      )
       this.baseObstaclePolygons.push(expandedPolygons)
+      this.baseObstacleConnectedTo.push(
+        connectedToNames.map((names) => names.join(",")),
+      )
     }
 
     // Initialize per-layer state (only for active layers)
     this.rectObstacles = this.baseObstaclePolygons
       .slice(0, this.layerCount)
       .map((polys) => [...polys])
+    this.baseObstacleCount = this.rectObstacles.map((polys) => polys.length)
+    this.connectionMeshCache = Array.from(
+      { length: this.layerCount },
+      () => new Map(),
+    )
     this.tracePolygonObstacles = Array.from(
       { length: this.layerCount },
       () => [],
@@ -317,6 +342,7 @@ export class GreedySequentialPathSolver extends BaseSolver {
         startLayerZ,
         endLayerZ,
         congestionScore: 0, // computed below
+        connNames,
       }
     })
 
@@ -428,6 +454,76 @@ export class GreedySequentialPathSolver extends BaseSolver {
     }
     const rawMesh = buildMeshFromRegions(cdtResult)
     this.meshes[layerZ] = mergeMesh(rawMesh)
+
+    // Invalidate connection-specific mesh cache (obstacles changed)
+    if (this.connectionMeshCache[layerZ]) {
+      this.connectionMeshCache[layerZ]!.clear()
+    }
+  }
+
+  /**
+   * Build a CDT mesh for `layerZ` that excludes base obstacle polygons
+   * electrically connected to `connNames`, and also excludes same-net trace
+   * obstacle polygons (for multi-segment net routing).  Cached per connNames
+   * key so repeated lookups in pickBestOnLayer are cheap.
+   */
+  private buildMeshExcluding(
+    layerZ: number,
+    connNames: string[],
+  ): Mesh | null {
+    const cacheKey = connNames.join("|")
+    const cache = this.connectionMeshCache[layerZ]
+    if (cache?.has(cacheKey)) return cache.get(cacheKey) ?? null
+
+    const baseCount = this.baseObstacleCount[layerZ] ?? 0
+    const connectedToList = this.baseObstacleConnectedTo[layerZ]
+    const rects = this.rectObstacles[layerZ]!
+
+    // Filter base obstacle polygons: keep only those NOT connected to connNames
+    const filteredRects: Point[][] = []
+    for (let i = 0; i < rects.length; i++) {
+      if (i < baseCount && connectedToList) {
+        // This is a base obstacle — check if any connName appears in its connectedTo
+        const obsConnStr = connectedToList[i]!
+        const exclude = connNames.some((cn) => obsConnStr.includes(cn))
+        if (exclude) continue
+      }
+      filteredRects.push(rects[i]!)
+    }
+
+    // Filter trace polygon obstacles: exclude same-net traces (for multi-segment routing)
+    const baseNet = connNames.length > 0 ? connNames[0]! : ""
+    const filteredTracePolys: Point[][] = []
+    const tracePolys = this.tracePolygonObstacles[layerZ]!
+    const traceNets = this.tracePolyNetNames[layerZ]!
+    for (let i = 0; i < tracePolys.length; i++) {
+      // Keep if different net
+      if (traceNets[i] !== GreedySequentialPathSolver.baseNetName(baseNet)) {
+        filteredTracePolys.push(tracePolys[i]!)
+      }
+    }
+
+    const mergedRects = mergeOverlappingRects(filteredRects)
+    const allObstacles = [...mergedRects, ...filteredTracePolys]
+
+    const totalVerts = allObstacles.reduce((sum, poly) => sum + poly.length, 0)
+    if (totalVerts > GreedySequentialPathSolver.MAX_OBSTACLE_VERTICES) {
+      cache?.set(cacheKey, null)
+      return null
+    }
+
+    const cdtResult = cdtTriangulate({
+      bounds: this.srj.bounds,
+      obstacles: allObstacles,
+    })
+    if (!cdtResult) {
+      cache?.set(cacheKey, null)
+      return null
+    }
+    const rawMesh = buildMeshFromRegions(cdtResult)
+    const mesh = mergeMesh(rawMesh)
+    cache?.set(cacheKey, mesh)
+    return mesh
   }
 
   /**
@@ -741,6 +837,11 @@ export class GreedySequentialPathSolver extends BaseSolver {
       () => [],
     )
     this.meshes = Array.from({ length: this.layerCount }, () => null)
+    this.connectionMeshCache = Array.from(
+      { length: this.layerCount },
+      () => new Map(),
+    )
+    this.baseObstacleCount = this.rectObstacles.map((polys) => polys.length)
     this.resolvedPaths = []
     this.traceObstaclePolys = []
     this.remaining = [...this.allConnections]
@@ -1216,78 +1317,111 @@ export class GreedySequentialPathSolver extends BaseSolver {
       const needStartVia = c.startLayerZ !== layerZ
       const needEndVia = c.endLayerZ !== layerZ
 
-      // Try the default nudge first, then alternate directions
-      const starts =
-        c.startCandidates.length > 0 ? c.startCandidates : [c.start]
-      const ends = c.endCandidates.length > 0 ? c.endCandidates : [c.end]
-
       let foundForThis = false
-      const maxViaDrift = this.viaDiameter * 2
       const baseNet = GreedySequentialPathSolver.baseNetName(c.name)
-      for (const s of starts) {
-        for (const e of ends) {
-          // Via safety only needed where a layer transition occurs.
-          // If the nudge point isn't via-safe, try to find a nearby safe point.
-          // Same-net obstacles are exempt (shared port connections).
-          let effectiveS = s
-          let effectiveE = e
-          if (needStartVia) {
-            if (!this.isViaSafe(s, baseNet)) {
-              const safe = this.findViaSafePoint(s, maxViaDrift, baseNet)
-              if (!safe) continue
-              effectiveS = safe
-            }
-          }
-          if (needEndVia) {
-            if (!this.isViaSafe(e, baseNet)) {
-              const safe = this.findViaSafePoint(e, maxViaDrift, baseNet)
-              if (!safe) continue
-              effectiveE = safe
-            }
-          }
 
-          // Bridge checks on the endpoint's native layer (exempt same net)
-          if (
-            this.bridgeCrossesExistingTrace(
-              c.originalStart,
-              effectiveS,
-              c.startLayerZ,
-              baseNet,
-            ) ||
-            this.bridgeCrossesExistingTrace(
-              effectiveE,
-              c.originalEnd,
-              c.endLayerZ,
-              baseNet,
-            )
-          )
-            continue
-
+      // -----------------------------------------------------------------
+      // Strategy 1: Direct routing using a connection-specific mesh that
+      // excludes the connection's own pad obstacles (and same-net trace
+      // obstacles for multi-segment nets).  This lets the pathfinder
+      // start/end naturally inside pad areas without nudging.
+      // -----------------------------------------------------------------
+      if (!needStartVia && !needEndVia) {
+        const connMesh = this.buildMeshExcluding(layerZ, c.connNames)
+        if (connMesh) {
           const r = this.usePolyanya
-            ? this.searchPolyanya(mesh, effectiveS, effectiveE)
-            : this.searchVG(mesh, layerZ, effectiveS, effectiveE)
-          if (r.cost < 0 || r.path.length === 0) continue
-
-          // Primary key: congestion score (higher = more crowded → route first).
-          // Secondary key: path cost (shortest or longest depending on phase).
-          const cong = c.congestionScore
-          const betterCongestion = cong > bestCongestion
-          const sameCongestion = cong === bestCongestion
-          const betterCost = pickShortest
-            ? r.cost < bestCost
-            : r.cost > bestCost
-          if (betterCongestion || (sameCongestion && betterCost)) {
-            bestIdx = i
-            bestCongestion = cong
-            bestCost = r.cost
-            bestPath = r.path
-            bestStart = effectiveS
-            bestEnd = effectiveE
+            ? this.searchPolyanya(connMesh, c.originalStart, c.originalEnd)
+            : this.searchVG(connMesh, layerZ, c.originalStart, c.originalEnd)
+          if (r.cost >= 0 && r.path.length > 0) {
+            const cong = c.congestionScore
+            const betterCongestion = cong > bestCongestion
+            const sameCongestion = cong === bestCongestion
+            const betterCost = pickShortest
+              ? r.cost < bestCost
+              : r.cost > bestCost
+            if (betterCongestion || (sameCongestion && betterCost)) {
+              bestIdx = i
+              bestCongestion = cong
+              bestCost = r.cost
+              bestPath = r.path
+              bestStart = c.originalStart
+              bestEnd = c.originalEnd
+            }
+            foundForThis = true
           }
-          foundForThis = true
-          break
         }
-        if (foundForThis) break
+      }
+
+      // -----------------------------------------------------------------
+      // Strategy 2 (fallback): Nudge endpoints outside obstacles and route
+      // on the global mesh.  Used when direct routing fails (CDT issue,
+      // degenerate geometry) or when via transitions are needed.
+      // -----------------------------------------------------------------
+      if (!foundForThis) {
+        const starts =
+          c.startCandidates.length > 0 ? c.startCandidates : [c.start]
+        const ends = c.endCandidates.length > 0 ? c.endCandidates : [c.end]
+
+        const maxViaDrift = this.viaDiameter * 2
+        for (const s of starts) {
+          for (const e of ends) {
+            let effectiveS = s
+            let effectiveE = e
+            if (needStartVia) {
+              if (!this.isViaSafe(s, baseNet)) {
+                const safe = this.findViaSafePoint(s, maxViaDrift, baseNet)
+                if (!safe) continue
+                effectiveS = safe
+              }
+            }
+            if (needEndVia) {
+              if (!this.isViaSafe(e, baseNet)) {
+                const safe = this.findViaSafePoint(e, maxViaDrift, baseNet)
+                if (!safe) continue
+                effectiveE = safe
+              }
+            }
+
+            if (
+              this.bridgeCrossesExistingTrace(
+                c.originalStart,
+                effectiveS,
+                c.startLayerZ,
+                baseNet,
+              ) ||
+              this.bridgeCrossesExistingTrace(
+                effectiveE,
+                c.originalEnd,
+                c.endLayerZ,
+                baseNet,
+              )
+            )
+              continue
+
+            const r = this.usePolyanya
+              ? this.searchPolyanya(mesh, effectiveS, effectiveE)
+              : this.searchVG(mesh, layerZ, effectiveS, effectiveE)
+            if (r.cost < 0 || r.path.length === 0) continue
+
+            const cong = c.congestionScore
+            const betterCongestion = cong > bestCongestion
+            const sameCongestion = cong === bestCongestion
+            const betterCost = pickShortest
+              ? r.cost < bestCost
+              : r.cost > bestCost
+            if (betterCongestion || (sameCongestion && betterCost)) {
+              bestIdx = i
+              bestCongestion = cong
+              bestCost = r.cost
+              bestPath = r.path
+              bestStart = effectiveS
+              bestEnd = effectiveE
+            }
+            foundForThis = true
+            break
+          }
+          if (foundForThis) break
+        }
       }
     }
 
