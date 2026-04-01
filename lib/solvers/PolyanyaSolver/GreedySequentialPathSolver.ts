@@ -1726,6 +1726,12 @@ export class GreedySequentialPathSolver extends BaseSolver {
           const connMesh = this.buildMeshExcluding(layerZ, c.connNames)
           if (connMesh) r = this.searchPolyanya(connMesh, c.originalStart, c.originalEnd)
         }
+        // If toggle path crosses committed traces, fallback to CDT exclusion
+        // (different mesh topology may provide a crossing-free corridor)
+        if (r.cost >= 0 && r.path.length > 0 && pathCrosses(r.path, baseNet) && this.useOccupancyToggle) {
+          const connMesh = this.buildMeshExcluding(layerZ, c.connNames)
+          if (connMesh) r = this.searchPolyanya(connMesh, c.originalStart, c.originalEnd)
+        }
         if (r.cost >= 0 && r.path.length > 0 && !pathCrosses(r.path, baseNet)) {
           this.remaining[cand.idx]!.start = c.originalStart
           this.remaining[cand.idx]!.end = c.originalEnd
@@ -1738,6 +1744,10 @@ export class GreedySequentialPathSolver extends BaseSolver {
           r = this.searchPolyanya(mesh, cand.effectiveS, cand.effectiveE)
           this.toggleConnectionObstacles(layerZ, c, baseNet, true)
         } else {
+          const connMesh = this.buildMeshExcluding(layerZ, c.connNames) ?? mesh
+          r = this.searchPolyanya(connMesh, cand.effectiveS, cand.effectiveE)
+        }
+        if (r.cost >= 0 && r.path.length > 0 && pathCrosses(r.path, baseNet) && this.useOccupancyToggle) {
           const connMesh = this.buildMeshExcluding(layerZ, c.connNames) ?? mesh
           r = this.searchPolyanya(connMesh, cand.effectiveS, cand.effectiveE)
         }
