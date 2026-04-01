@@ -912,39 +912,10 @@ export class GreedySequentialPathSolver extends BaseSolver {
     }
     if (pts.length < 2) return []
 
-    // Extend endpoints by clearance unless the original point is a shared junction
-    if (originalStart) {
-      const key = `${originalStart.x},${originalStart.y}`
-      if (!this.sharedPoints.has(key)) {
-        const first = pts[0]!
-        const second = pts[1]!
-        const dx = second.x - first.x
-        const dy = second.y - first.y
-        const len = Math.hypot(dx, dy)
-        if (len > 1e-9) {
-          pts[0] = {
-            x: first.x - (dx / len) * clearance,
-            y: first.y - (dy / len) * clearance,
-          }
-        }
-      }
-    }
-    if (originalEnd) {
-      const key = `${originalEnd.x},${originalEnd.y}`
-      if (!this.sharedPoints.has(key)) {
-        const last = pts[pts.length - 1]!
-        const secondToLast = pts[pts.length - 2]!
-        const dx = last.x - secondToLast.x
-        const dy = last.y - secondToLast.y
-        const len = Math.hypot(dx, dy)
-        if (len > 1e-9) {
-          pts[pts.length - 1] = {
-            x: last.x + (dx / len) * clearance,
-            y: last.y + (dy / len) * clearance,
-          }
-        }
-      }
-    }
+    // No linear endpoint extension needed — the semicircular endcaps added
+    // at the end of this method already provide clearance coverage beyond
+    // each endpoint.  The old linear extension was redundant and caused
+    // double-extension (2× clearance) at the trace tips.
 
     // Compute per-segment unit normals (pointing left when walking A→B)
     const normals: { nx: number; ny: number }[] = []
