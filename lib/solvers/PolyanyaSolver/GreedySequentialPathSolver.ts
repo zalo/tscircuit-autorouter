@@ -1408,7 +1408,7 @@ export class GreedySequentialPathSolver extends BaseSolver {
 
     this.resolvedPaths.push({
       connectionName: conn.name,
-      route: this.subdivideRoute(fullRoute),
+      route: fullRoute,
       vias,
     })
 
@@ -1571,12 +1571,6 @@ export class GreedySequentialPathSolver extends BaseSolver {
       console.warn(
         `GreedySequentialPathSolver: timeout after ${GreedySequentialPathSolver.MAX_SOLVE_TIME_MS}ms, ${this.resolvedPaths.length}/${this.totalConnections} routed`,
       )
-      // Finish any active relaxation cleanly before bailing
-      if (this.relaxState !== "idle") {
-        this.relaxer.hardPass()
-        this.rebuildAllTraceObstacles()
-        this.relaxState = "idle"
-      }
       this.saveIfBest()
       if (this.bestResults) {
         this.resolvedPaths = this.bestResults
@@ -1589,20 +1583,7 @@ export class GreedySequentialPathSolver extends BaseSolver {
     }
 
     // -----------------------------------------------------------------------
-    // Drive relaxation one step at a time so each iteration is a visible
-    // frame in the debugger.
-    // -----------------------------------------------------------------------
-    if (this.relaxState !== "idle") {
-      const stillRelaxing = this.stepRelax()
-      if (!stillRelaxing && this.relaxIsStuck) {
-        // Heavy relaxation just finished — try routing again without
-        // advancing the phase yet (stuckRelaxCount already incremented).
-      }
-      return
-    }
-
-    // -----------------------------------------------------------------------
-    // Normal routing step
+    // Normal routing step (relaxation disabled)
     // -----------------------------------------------------------------------
     if (this.remaining.length === 0) {
       this.saveIfBest()
@@ -1616,20 +1597,10 @@ export class GreedySequentialPathSolver extends BaseSolver {
     const { idx, path, layerZ } = this.pickBestAcrossLayers(pickShortest)
 
     if (idx < 0) {
-      // Stuck — start a heavy relaxation session before advancing phase
-      if (this.stuckRelaxCount < GreedySequentialPathSolver.MAX_STUCK_RELAX) {
-        this.stuckRelaxCount++
-        this.beginRelax(GreedySequentialPathSolver.RELAX_ITER_STUCK, true)
-        return
-      }
-      // Relaxation didn't help — advance to next phase
-      this.stuckRelaxCount = 0
+      // Stuck — advance to next phase
       this.advancePhase()
       return
     }
-
-    // Successfully picked a route — reset stuck counter
-    this.stuckRelaxCount = 0
 
     const conn = this.remaining[idx]!
     this.remaining.splice(idx, 1)
@@ -1637,9 +1608,6 @@ export class GreedySequentialPathSolver extends BaseSolver {
 
     this.progress =
       (this.totalConnections - this.remaining.length) / this.totalConnections
-
-    // Begin light relaxation so each iteration shows up as a separate frame
-    this.beginRelax(GreedySequentialPathSolver.RELAX_ITER_COMMIT, false)
   }
 
   /** Run post-solve validation: check unrouted connections and same-layer crossings */
