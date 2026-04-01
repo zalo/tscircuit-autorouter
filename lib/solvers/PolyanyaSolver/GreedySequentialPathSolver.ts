@@ -1343,14 +1343,21 @@ export class GreedySequentialPathSolver extends BaseSolver {
     return { cost: r.cost, path: r.path }
   }
 
-  /** Max connections to attempt CDT + pathfinding for per pickBestOnLayer call.
-   *  Pre-sorted by Euclidean distance so we try the most promising first.
-   *  Keeps total CDT builds at O(N × K) instead of O(N²). */
-  private static MAX_CANDIDATES_PER_PICK = 5
-
   /**
    * Pick the best connection to route on a specific layer.
-   * Returns index into remaining, or -1 if nothing is routable.
+   *
+   * Two-phase approach to minimize expensive CDT rebuilds:
+   *
+   * Phase 1 (cheap): Rank all remaining connections using nudge endpoints
+   * on the GLOBAL mesh.  This gives approximate path costs without any CDT
+   * rebuilds.  Connections that can't even nudge-route are deprioritized.
+   *
+   * Phase 2 (expensive): For the top candidates from Phase 1, build the
+   * connection-specific exclusion mesh and pathfind from originalStart to
+   * originalEnd (the correct, no-nudge path).  Commit the first one that
+   * succeeds.
+   *
+   * Total CDT builds per step: O(1) best case, O(K) worst case.
    */
   private pickBestOnLayer(
     layerZ: number,
@@ -1359,175 +1366,160 @@ export class GreedySequentialPathSolver extends BaseSolver {
     const mesh = this.meshes[layerZ]
     if (!mesh) return { idx: -1, path: [] }
 
-    let bestIdx = -1
-    let bestCongestion = -1
-    let bestCost = pickShortest ? Infinity : -Infinity
-    let bestPath: Point[] = []
+    // -------------------------------------------------------------------
+    // Phase 1: Cheap ranking — nudge + global mesh (no CDT rebuild)
+    // -------------------------------------------------------------------
+    const self = this
+    type Candidate = {
+      idx: number
+      conn: (typeof self.remaining)[0]
+      approxCost: number
+      routable: boolean
+      // For via fallback
+      effectiveS?: Point
+      effectiveE?: Point
+      needsVia: boolean
+    }
+    const ranked: Candidate[] = []
 
-    // Track which start/end combo was best for the winning connection
-    let bestStart: Point | null = null
-    let bestEnd: Point | null = null
-
-    // Pre-sort candidates by Euclidean distance (cheap heuristic) so we
-    // only attempt expensive CDT + pathfinding for the most promising ones.
-    // This reduces CDT builds from O(N) per step to O(K) per step.
-    const candidates = this.remaining.map((c, i) => ({
-      idx: i,
-      conn: c,
-      euclidean: Math.hypot(
-        c.originalEnd.x - c.originalStart.x,
-        c.originalEnd.y - c.originalStart.y,
-      ),
-    }))
-    candidates.sort((a, b) =>
-      pickShortest
-        ? a.euclidean - b.euclidean
-        : b.euclidean - a.euclidean,
-    )
-
-    const limit = Math.min(
-      candidates.length,
-      GreedySequentialPathSolver.MAX_CANDIDATES_PER_PICK,
-    )
-
-    for (let ci = 0; ci < candidates.length; ci++) {
-      const { idx: i, conn: c } = candidates[ci]!
-
-      // Check if vias are needed at start/end for this layer
+    for (let i = 0; i < this.remaining.length; i++) {
+      const c = this.remaining[i]!
       const needStartVia = c.startLayerZ !== layerZ
       const needEndVia = c.endLayerZ !== layerZ
-
-      let foundForThis = false
+      const needsVia = needStartVia || needEndVia
       const baseNet = GreedySequentialPathSolver.baseNetName(c.name)
 
-      // Stop after K candidates if we already found at least one valid path.
-      // Continue beyond K only if nothing has been found yet (to avoid
-      // returning -1 when a route does exist further down the list).
-      if (ci >= limit && bestIdx >= 0) break
-
-      // -----------------------------------------------------------------
-      // Strategy 1: Direct routing with own-net obstacles excluded.
-      // -----------------------------------------------------------------
-      if (!needStartVia && !needEndVia) {
-        // Build a mesh with own-net obstacles excluded so pathfinder can
-        // start/end inside the connection's own pads.  Cached within a
-        // single pickBestOnLayer call (invalidated after each commitPath).
-        const connMesh = this.buildMeshExcluding(layerZ, c.connNames)
-        if (connMesh) {
-          const r = this.usePolyanya
-            ? this.searchPolyanya(connMesh, c.originalStart, c.originalEnd)
-            : this.searchVG(connMesh, layerZ, c.originalStart, c.originalEnd)
-          if (r.cost >= 0 && r.path.length > 0) {
-            const cong = c.congestionScore
-            const betterCost = pickShortest
-              ? r.cost < bestCost
-              : r.cost > bestCost
-            const sameCost =
-              Math.abs(r.cost - bestCost) < 1e-6 ||
-              (bestCost === Infinity && r.cost === Infinity) ||
-              (bestCost === -Infinity && r.cost === -Infinity)
-            if (betterCost || (sameCost && cong > bestCongestion)) {
-              bestIdx = i
-              bestCongestion = cong
-              bestCost = r.cost
-              bestPath = r.path
-              bestStart = c.originalStart
-              bestEnd = c.originalEnd
-            }
-            foundForThis = true
-          }
-        }
-      }
-
-      // -----------------------------------------------------------------
-      // Strategy 2 (fallback): Nudge endpoints outside obstacles and route
-      // using a connection-specific mesh (own-net obstacles excluded).
-      // Used when direct routing fails or when via transitions are needed.
-      // -----------------------------------------------------------------
-      if (!foundForThis) {
+      if (!needsVia) {
+        // Use nudge candidates on the global mesh for approximate cost
         const starts =
           c.startCandidates.length > 0 ? c.startCandidates : [c.start]
         const ends = c.endCandidates.length > 0 ? c.endCandidates : [c.end]
-
-        // Use connection-specific mesh so own-net endpoint octagons and
-        // same-net trace obstacles are excluded for the nudge path too.
-        const fallbackMesh =
-          this.buildMeshExcluding(layerZ, c.connNames) ?? mesh
-
+        let bestApprox = pickShortest ? Infinity : -Infinity
+        let found = false
+        for (const s of starts) {
+          for (const e of ends) {
+            const r = this.usePolyanya
+              ? this.searchPolyanya(mesh, s, e)
+              : this.searchVG(mesh, layerZ, s, e)
+            if (r.cost < 0 || r.path.length === 0) continue
+            const better = pickShortest
+              ? r.cost < bestApprox
+              : r.cost > bestApprox
+            if (better) bestApprox = r.cost
+            found = true
+            break
+          }
+          if (found) break
+        }
+        // If nudge can't route on global mesh, use Euclidean as fallback estimate
+        if (!found) {
+          bestApprox = Math.hypot(
+            c.originalEnd.x - c.originalStart.x,
+            c.originalEnd.y - c.originalStart.y,
+          )
+        }
+        ranked.push({ idx: i, conn: c, approxCost: bestApprox, routable: found, needsVia })
+      } else {
+        // Via case: compute approximate cost from nudge candidates
+        const starts =
+          c.startCandidates.length > 0 ? c.startCandidates : [c.start]
+        const ends = c.endCandidates.length > 0 ? c.endCandidates : [c.end]
+        let bestApprox = pickShortest ? Infinity : -Infinity
+        let found = false
+        let bestS: Point | undefined
+        let bestE: Point | undefined
         const maxViaDrift = this.viaDiameter * 2
+
         for (const s of starts) {
           for (const e of ends) {
             let effectiveS = s
             let effectiveE = e
-            if (needStartVia) {
-              if (!this.isViaSafe(s, baseNet)) {
-                const safe = this.findViaSafePoint(s, maxViaDrift, baseNet)
-                if (!safe) continue
-                effectiveS = safe
-              }
+            if (needStartVia && !this.isViaSafe(s, baseNet)) {
+              const safe = this.findViaSafePoint(s, maxViaDrift, baseNet)
+              if (!safe) continue
+              effectiveS = safe
             }
-            if (needEndVia) {
-              if (!this.isViaSafe(e, baseNet)) {
-                const safe = this.findViaSafePoint(e, maxViaDrift, baseNet)
-                if (!safe) continue
-                effectiveE = safe
-              }
+            if (needEndVia && !this.isViaSafe(e, baseNet)) {
+              const safe = this.findViaSafePoint(e, maxViaDrift, baseNet)
+              if (!safe) continue
+              effectiveE = safe
             }
-
             if (
-              this.bridgeCrossesExistingTrace(
-                c.originalStart,
-                effectiveS,
-                c.startLayerZ,
-                baseNet,
-              ) ||
-              this.bridgeCrossesExistingTrace(
-                effectiveE,
-                c.originalEnd,
-                c.endLayerZ,
-                baseNet,
-              )
-            )
-              continue
+              this.bridgeCrossesExistingTrace(c.originalStart, effectiveS, c.startLayerZ, baseNet) ||
+              this.bridgeCrossesExistingTrace(effectiveE, c.originalEnd, c.endLayerZ, baseNet)
+            ) continue
 
             const r = this.usePolyanya
-              ? this.searchPolyanya(fallbackMesh, effectiveS, effectiveE)
-              : this.searchVG(fallbackMesh, layerZ, effectiveS, effectiveE)
+              ? this.searchPolyanya(mesh, effectiveS, effectiveE)
+              : this.searchVG(mesh, layerZ, effectiveS, effectiveE)
             if (r.cost < 0 || r.path.length === 0) continue
-
-            // Primary key: path cost (shortest or longest per phase).
-            // Secondary key: congestion score (higher = more crowded, tiebreaker).
-            const cong = c.congestionScore
-            const betterCost = pickShortest
-              ? r.cost < bestCost
-              : r.cost > bestCost
-            const sameCost =
-              Math.abs(r.cost - bestCost) < 1e-6 ||
-              (bestCost === Infinity && r.cost === Infinity) ||
-              (bestCost === -Infinity && r.cost === -Infinity)
-            if (betterCost || (sameCost && cong > bestCongestion)) {
-              bestIdx = i
-              bestCongestion = cong
-              bestCost = r.cost
-              bestPath = r.path
-              bestStart = effectiveS
-              bestEnd = effectiveE
+            const better = pickShortest ? r.cost < bestApprox : r.cost > bestApprox
+            if (better) {
+              bestApprox = r.cost
+              bestS = effectiveS
+              bestE = effectiveE
             }
-            foundForThis = true
+            found = true
             break
           }
-          if (foundForThis) break
+          if (found) break
+        }
+        if (!found) {
+          bestApprox = Math.hypot(
+            c.originalEnd.x - c.originalStart.x,
+            c.originalEnd.y - c.originalStart.y,
+          )
+        }
+        ranked.push({
+          idx: i, conn: c, approxCost: bestApprox, routable: found,
+          needsVia, effectiveS: bestS, effectiveE: bestE,
+        })
+      }
+    }
+
+    // Sort: routable first, then by approximate cost
+    ranked.sort((a, b) => {
+      if (a.routable !== b.routable) return a.routable ? -1 : 1
+      return pickShortest
+        ? a.approxCost - b.approxCost
+        : b.approxCost - a.approxCost
+    })
+
+    // -------------------------------------------------------------------
+    // Phase 2: Expensive verification — build exclusion mesh for top
+    // candidates only, pathfind from originalStart → originalEnd.
+    // -------------------------------------------------------------------
+    for (const cand of ranked) {
+      const c = cand.conn
+
+      if (!cand.needsVia) {
+        // Build connection-specific mesh (CDT rebuild) and pathfind directly
+        const connMesh = this.buildMeshExcluding(layerZ, c.connNames)
+        if (!connMesh) continue
+        const r = this.usePolyanya
+          ? this.searchPolyanya(connMesh, c.originalStart, c.originalEnd)
+          : this.searchVG(connMesh, layerZ, c.originalStart, c.originalEnd)
+        if (r.cost >= 0 && r.path.length > 0) {
+          this.remaining[cand.idx]!.start = c.originalStart
+          this.remaining[cand.idx]!.end = c.originalEnd
+          return { idx: cand.idx, path: r.path }
+        }
+      } else if (cand.routable && cand.effectiveS && cand.effectiveE) {
+        // Via case: the nudge path already verified on global mesh.
+        // Re-verify on exclusion mesh for correctness.
+        const connMesh = this.buildMeshExcluding(layerZ, c.connNames) ?? mesh
+        const r = this.usePolyanya
+          ? this.searchPolyanya(connMesh, cand.effectiveS, cand.effectiveE)
+          : this.searchVG(connMesh, layerZ, cand.effectiveS, cand.effectiveE)
+        if (r.cost >= 0 && r.path.length > 0) {
+          this.remaining[cand.idx]!.start = cand.effectiveS
+          this.remaining[cand.idx]!.end = cand.effectiveE
+          return { idx: cand.idx, path: r.path }
         }
       }
     }
 
-    // Update the winning connection's active start/end
-    if (bestIdx >= 0 && bestStart && bestEnd) {
-      this.remaining[bestIdx]!.start = bestStart
-      this.remaining[bestIdx]!.end = bestEnd
-    }
-
-    return { idx: bestIdx, path: bestPath }
+    return { idx: -1, path: [] }
   }
 
   /**
