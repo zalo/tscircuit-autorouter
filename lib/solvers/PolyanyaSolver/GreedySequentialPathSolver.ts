@@ -229,10 +229,7 @@ export class GreedySequentialPathSolver extends BaseSolver {
     this.minTraceWidth = params.minTraceWidth
     this.margin = params.margin
     this.useObstacles = params.useObstacles ?? true
-    // CDT exclusion is the default (correct, no crossings). Occupancy toggle
-    // is faster but has centroid-based classification imprecision that can
-    // cause trace crossings on complex boards (e.g. DIP16 crossing traces).
-    this.useOccupancyToggle = params.useOccupancyToggle ?? false
+    this.useOccupancyToggle = params.useOccupancyToggle ?? true
     this.usePolyanya = params.usePolyanya ?? true
     this.maxLayerCount = Math.max(1, params.srj.layerCount ?? 2)
     this.layerCount = Math.min(2, this.maxLayerCount) // Start with 2 layers for layer-aware routing
@@ -1689,52 +1686,65 @@ export class GreedySequentialPathSolver extends BaseSolver {
     // Phase 2: Commit the best routable candidate.
     // Toggle approach: unblock own obstacles, search, re-block. No CDT rebuild.
     // Exclusion approach: buildMeshExcluding CDT rebuild for the top candidate.
+    //
+    // After finding a path, validate it doesn't cross any committed trace
+    // on the same layer before returning.  This catches CDT leaks where
+    // the pathfinder routes through free-space gaps in obstacle polygons.
     // -------------------------------------------------------------------
+    // Helper: check if a candidate path crosses any committed trace on this layer
+    const pathCrosses = (path: Point[], exemptNet: string): boolean => {
+      for (let i = 0; i < path.length - 1; i++) {
+        const a = path[i]!
+        const b = path[i + 1]!
+        for (const rp of this.resolvedPaths) {
+          if (GreedySequentialPathSolver.baseNetName(rp.connectionName) === exemptNet) continue
+          for (let j = 0; j < rp.route.length - 1; j++) {
+            const c = rp.route[j]!
+            const d = rp.route[j + 1]!
+            if (c.z !== layerZ || d.z !== layerZ) continue
+            if (segSegIntersection(a.x, a.y, b.x, b.y, c.x, c.y, d.x, d.y)) {
+              return true
+            }
+          }
+        }
+      }
+      return false
+    }
+
     for (const cand of ranked) {
       if (!cand.routable) continue
       const c = cand.conn
       const baseNet = GreedySequentialPathSolver.baseNetName(c.name)
 
       if (!cand.needsVia) {
+        let r: { cost: number; path: Point[] } = { cost: -1, path: [] }
         if (this.useOccupancyToggle) {
-          // Toggle: unblock, search on global mesh, re-block
           this.toggleConnectionObstacles(layerZ, c, baseNet, false)
-          const r = this.searchPolyanya(mesh, c.originalStart, c.originalEnd)
+          r = this.searchPolyanya(mesh, c.originalStart, c.originalEnd)
           this.toggleConnectionObstacles(layerZ, c, baseNet, true)
-          if (r.cost >= 0 && r.path.length > 0) {
-            this.remaining[cand.idx]!.start = c.originalStart
-            this.remaining[cand.idx]!.end = c.originalEnd
-            return { idx: cand.idx, path: r.path }
-          }
         } else {
-          // Exclusion: CDT rebuild
           const connMesh = this.buildMeshExcluding(layerZ, c.connNames)
-          if (!connMesh) continue
-          const r = this.searchPolyanya(connMesh, c.originalStart, c.originalEnd)
-          if (r.cost >= 0 && r.path.length > 0) {
-            this.remaining[cand.idx]!.start = c.originalStart
-            this.remaining[cand.idx]!.end = c.originalEnd
-            return { idx: cand.idx, path: r.path }
-          }
+          if (connMesh) r = this.searchPolyanya(connMesh, c.originalStart, c.originalEnd)
+        }
+        if (r.cost >= 0 && r.path.length > 0 && !pathCrosses(r.path, baseNet)) {
+          this.remaining[cand.idx]!.start = c.originalStart
+          this.remaining[cand.idx]!.end = c.originalEnd
+          return { idx: cand.idx, path: r.path }
         }
       } else if (cand.effectiveS && cand.effectiveE) {
+        let r: { cost: number; path: Point[] } = { cost: -1, path: [] }
         if (this.useOccupancyToggle) {
           this.toggleConnectionObstacles(layerZ, c, baseNet, false)
-          const r = this.searchPolyanya(mesh, cand.effectiveS, cand.effectiveE)
+          r = this.searchPolyanya(mesh, cand.effectiveS, cand.effectiveE)
           this.toggleConnectionObstacles(layerZ, c, baseNet, true)
-          if (r.cost >= 0 && r.path.length > 0) {
-            this.remaining[cand.idx]!.start = cand.effectiveS
-            this.remaining[cand.idx]!.end = cand.effectiveE
-            return { idx: cand.idx, path: r.path }
-          }
         } else {
           const connMesh = this.buildMeshExcluding(layerZ, c.connNames) ?? mesh
-          const r = this.searchPolyanya(connMesh, cand.effectiveS, cand.effectiveE)
-          if (r.cost >= 0 && r.path.length > 0) {
-            this.remaining[cand.idx]!.start = cand.effectiveS
-            this.remaining[cand.idx]!.end = cand.effectiveE
-            return { idx: cand.idx, path: r.path }
-          }
+          r = this.searchPolyanya(connMesh, cand.effectiveS, cand.effectiveE)
+        }
+        if (r.cost >= 0 && r.path.length > 0 && !pathCrosses(r.path, baseNet)) {
+          this.remaining[cand.idx]!.start = cand.effectiveS
+          this.remaining[cand.idx]!.end = cand.effectiveE
+          return { idx: cand.idx, path: r.path }
         }
       }
     }
