@@ -498,6 +498,31 @@ export class GreedySequentialPathSolver extends BaseSolver {
     }
   }
 
+  /** Quick check: does this connection have any obstacles that would be
+   *  excluded by buildMeshExcluding?  If not, the global mesh is identical
+   *  and we can skip the expensive CDT rebuild entirely. */
+  private connectionHasExclusions(
+    layerZ: number,
+    connNames: string[],
+    baseNet: string,
+  ): boolean {
+    // Check base obstacles
+    const connectedToList = this.baseObstacleConnectedTo[layerZ]
+    const baseCount = this.baseObstacleCount[layerZ] ?? 0
+    if (connectedToList) {
+      for (let i = 0; i < baseCount; i++) {
+        const obsConnStr = connectedToList[i]!
+        if (connNames.some((cn) => obsConnStr.includes(cn))) return true
+      }
+    }
+    // Check same-net trace obstacles
+    const traceNets = this.tracePolyNetNames[layerZ]!
+    for (let i = 0; i < traceNets.length; i++) {
+      if (traceNets[i] === baseNet) return true
+    }
+    return false
+  }
+
   /**
    * Build a CDT mesh for `layerZ` that excludes base obstacle polygons
    * electrically connected to `connNames`, and also excludes same-net trace
@@ -1349,20 +1374,21 @@ export class GreedySequentialPathSolver extends BaseSolver {
       const baseNet = GreedySequentialPathSolver.baseNetName(c.name)
 
       // -----------------------------------------------------------------
-      // Strategy 1: Direct routing using a connection-specific mesh that
-      // excludes the connection's own pad obstacles (and same-net trace
-      // obstacles for multi-segment nets).  This lets the pathfinder
-      // start/end naturally inside pad areas without nudging.
+      // Strategy 1: Direct routing.  Try the global mesh first (cheapest).
+      // Only fall back to building a connection-specific mesh (expensive
+      // CDT rebuild) if the global mesh can't find a path — typically
+      // because the start/end point is inside a connected obstacle.
       // -----------------------------------------------------------------
       if (!needStartVia && !needEndVia) {
+        // Build a mesh with own-net obstacles excluded so pathfinder can
+        // start/end inside the connection's own pads.  Cached within a
+        // single pickBestOnLayer call (invalidated after each commitPath).
         const connMesh = this.buildMeshExcluding(layerZ, c.connNames)
         if (connMesh) {
           const r = this.usePolyanya
             ? this.searchPolyanya(connMesh, c.originalStart, c.originalEnd)
             : this.searchVG(connMesh, layerZ, c.originalStart, c.originalEnd)
           if (r.cost >= 0 && r.path.length > 0) {
-            // Primary key: path cost (shortest or longest per phase).
-            // Secondary key: congestion score (higher = more crowded, tiebreaker).
             const cong = c.congestionScore
             const betterCost = pickShortest
               ? r.cost < bestCost
