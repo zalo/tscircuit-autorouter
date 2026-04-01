@@ -208,6 +208,12 @@ export class GreedySequentialPathSolver extends BaseSolver {
    *  Built once when the global mesh is constructed. */
   private connObstacleIndices: Map<string, number[]>[] = []
 
+  /** Per-layer: maps "x,y" endpoint position → array of CDT obstacle indices
+   *  at that position (base obstacles + endpoint octagons).  Used by the
+   *  toggle approach to unblock only the specific obstacles at a connection's
+   *  start/end, not every obstacle on the same net. */
+  private endpointObstacleIndices: Map<string, number[]>[] = []
+
   constructor(params: {
     srj: SimpleRouteJson
     colorMap: Record<string, string>
@@ -565,6 +571,37 @@ export class GreedySequentialPathSolver extends BaseSolver {
         arr.push(obsIdx)
       }
       this.connObstacleIndices[layerZ] = map
+
+      // Build endpoint → obstacle index mapping.
+      // For each obstacle in the mesh, check which connection endpoints
+      // fall inside it.  Only those specific obstacles get unblocked
+      // when routing that connection (not the entire net).
+      const epMap = new Map<string, number[]>()
+      const conns = this.allConnections ?? []
+      for (const obsIdx of mesh.getObstacleIndices()) {
+        if (obsIdx < 0 || obsIdx >= allObstacles.length) continue
+        const poly = allObstacles[obsIdx]!
+        // Check each connection's endpoints
+        for (const conn of conns) {
+          if (conn.startLayerZ === layerZ) {
+            const key = `${conn.originalStart.x},${conn.originalStart.y}`
+            if (this.pointInPolygon(conn.originalStart.x, conn.originalStart.y, poly)) {
+              let arr = epMap.get(key)
+              if (!arr) { arr = []; epMap.set(key, arr) }
+              if (!arr.includes(obsIdx)) arr.push(obsIdx)
+            }
+          }
+          if (conn.endLayerZ === layerZ) {
+            const key = `${conn.originalEnd.x},${conn.originalEnd.y}`
+            if (this.pointInPolygon(conn.originalEnd.x, conn.originalEnd.y, poly)) {
+              let arr = epMap.get(key)
+              if (!arr) { arr = []; epMap.set(key, arr) }
+              if (!arr.includes(obsIdx)) arr.push(obsIdx)
+            }
+          }
+        }
+      }
+      this.endpointObstacleIndices[layerZ] = epMap
     }
   }
 
@@ -583,33 +620,41 @@ export class GreedySequentialPathSolver extends BaseSolver {
 
   /**
    * Toggle obstacle occupancy for a connection on the global mesh.
-   * Unblocks all CDT obstacles belonging to connNames (and same baseNet
-   * trace obstacles) so SearchInstance can pathfind through them.
-   * Call with blocked=false before pathfinding, blocked=true after.
+   * Only unblocks the specific obstacles at the connection's start/end
+   * positions — NOT every obstacle on the same net.  This prevents
+   * traces from bridging through unrelated pads on the same net.
+   *
+   * Also toggles same-net trace obstacles (for multi-segment net routing).
    */
   private toggleConnectionObstacles(
     layerZ: number,
-    connNames: string[],
+    conn: { originalStart: Point; originalEnd: Point; connNames: string[] },
     baseNet: string,
     blocked: boolean,
   ): void {
     const mesh = this.meshes[layerZ]
     if (!mesh) return
-    const map = this.connObstacleIndices[layerZ]
-    if (!map) return
 
-    // Toggle base/endpoint obstacles matching connNames
-    for (const cn of connNames) {
-      for (const [key, indices] of map) {
-        if (key.includes(cn)) {
+    // Toggle only obstacles at this connection's specific endpoints
+    const epMap = this.endpointObstacleIndices[layerZ]
+    if (epMap) {
+      const startKey = `${conn.originalStart.x},${conn.originalStart.y}`
+      const endKey = `${conn.originalEnd.x},${conn.originalEnd.y}`
+      for (const key of [startKey, endKey]) {
+        const indices = epMap.get(key)
+        if (indices) {
           for (const idx of indices) mesh.setObstacleBlocked(idx, blocked)
         }
       }
     }
-    // Toggle same-net trace obstacles
-    const netIndices = map.get(baseNet)
-    if (netIndices) {
-      for (const idx of netIndices) mesh.setObstacleBlocked(idx, blocked)
+
+    // Toggle same-net trace obstacles (for multi-segment net routing)
+    const connMap = this.connObstacleIndices[layerZ]
+    if (connMap) {
+      const netIndices = connMap.get(baseNet)
+      if (netIndices) {
+        for (const idx of netIndices) mesh.setObstacleBlocked(idx, blocked)
+      }
     }
   }
 
@@ -1019,6 +1064,10 @@ export class GreedySequentialPathSolver extends BaseSolver {
       () => new Map(),
     )
     this.connObstacleIndices = Array.from(
+      { length: this.layerCount },
+      () => new Map(),
+    )
+    this.endpointObstacleIndices = Array.from(
       { length: this.layerCount },
       () => new Map(),
     )
@@ -1514,9 +1563,9 @@ export class GreedySequentialPathSolver extends BaseSolver {
 
         if (this.useOccupancyToggle) {
           // Toggle approach: unblock own obstacles, search on global mesh
-          this.toggleConnectionObstacles(layerZ, c.connNames, baseNet, false)
+          this.toggleConnectionObstacles(layerZ, c, baseNet, false)
           const r = this.searchPolyanya(mesh, c.originalStart, c.originalEnd)
-          this.toggleConnectionObstacles(layerZ, c.connNames, baseNet, true)
+          this.toggleConnectionObstacles(layerZ, c, baseNet, true)
           if (r.cost >= 0 && r.path.length > 0) {
             bestApprox = r.cost
             found = true
@@ -1626,9 +1675,9 @@ export class GreedySequentialPathSolver extends BaseSolver {
       if (!cand.needsVia) {
         if (this.useOccupancyToggle) {
           // Toggle: unblock, search on global mesh, re-block
-          this.toggleConnectionObstacles(layerZ, c.connNames, baseNet, false)
+          this.toggleConnectionObstacles(layerZ, c, baseNet, false)
           const r = this.searchPolyanya(mesh, c.originalStart, c.originalEnd)
-          this.toggleConnectionObstacles(layerZ, c.connNames, baseNet, true)
+          this.toggleConnectionObstacles(layerZ, c, baseNet, true)
           if (r.cost >= 0 && r.path.length > 0) {
             this.remaining[cand.idx]!.start = c.originalStart
             this.remaining[cand.idx]!.end = c.originalEnd
@@ -1647,9 +1696,9 @@ export class GreedySequentialPathSolver extends BaseSolver {
         }
       } else if (cand.effectiveS && cand.effectiveE) {
         if (this.useOccupancyToggle) {
-          this.toggleConnectionObstacles(layerZ, c.connNames, baseNet, false)
+          this.toggleConnectionObstacles(layerZ, c, baseNet, false)
           const r = this.searchPolyanya(mesh, cand.effectiveS, cand.effectiveE)
-          this.toggleConnectionObstacles(layerZ, c.connNames, baseNet, true)
+          this.toggleConnectionObstacles(layerZ, c, baseNet, true)
           if (r.cost >= 0 && r.path.length > 0) {
             this.remaining[cand.idx]!.start = cand.effectiveS
             this.remaining[cand.idx]!.end = cand.effectiveE
