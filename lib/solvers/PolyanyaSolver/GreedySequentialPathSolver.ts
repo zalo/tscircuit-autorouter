@@ -1361,13 +1361,17 @@ export class GreedySequentialPathSolver extends BaseSolver {
             ? this.searchPolyanya(connMesh, c.originalStart, c.originalEnd)
             : this.searchVG(connMesh, layerZ, c.originalStart, c.originalEnd)
           if (r.cost >= 0 && r.path.length > 0) {
+            // Primary key: path cost (shortest or longest per phase).
+            // Secondary key: congestion score (higher = more crowded, tiebreaker).
             const cong = c.congestionScore
-            const betterCongestion = cong > bestCongestion
-            const sameCongestion = cong === bestCongestion
             const betterCost = pickShortest
               ? r.cost < bestCost
               : r.cost > bestCost
-            if (betterCongestion || (sameCongestion && betterCost)) {
+            const sameCost =
+              Math.abs(r.cost - bestCost) < 1e-6 ||
+              (bestCost === Infinity && r.cost === Infinity) ||
+              (bestCost === -Infinity && r.cost === -Infinity)
+            if (betterCost || (sameCost && cong > bestCongestion)) {
               bestIdx = i
               bestCongestion = cong
               bestCost = r.cost
@@ -1436,13 +1440,17 @@ export class GreedySequentialPathSolver extends BaseSolver {
               : this.searchVG(fallbackMesh, layerZ, effectiveS, effectiveE)
             if (r.cost < 0 || r.path.length === 0) continue
 
+            // Primary key: path cost (shortest or longest per phase).
+            // Secondary key: congestion score (higher = more crowded, tiebreaker).
             const cong = c.congestionScore
-            const betterCongestion = cong > bestCongestion
-            const sameCongestion = cong === bestCongestion
             const betterCost = pickShortest
               ? r.cost < bestCost
               : r.cost > bestCost
-            if (betterCongestion || (sameCongestion && betterCost)) {
+            const sameCost =
+              Math.abs(r.cost - bestCost) < 1e-6 ||
+              (bestCost === Infinity && r.cost === Infinity) ||
+              (bestCost === -Infinity && r.cost === -Infinity)
+            if (betterCost || (sameCost && cong > bestCongestion)) {
               bestIdx = i
               bestCongestion = cong
               bestCost = r.cost
