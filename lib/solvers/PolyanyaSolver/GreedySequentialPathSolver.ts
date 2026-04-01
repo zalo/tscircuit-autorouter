@@ -256,6 +256,38 @@ export class GreedySequentialPathSolver extends BaseSolver {
     this.rectObstacles = this.baseObstaclePolygons
       .slice(0, this.layerCount)
       .map((polys) => [...polys])
+
+    // Add octagonal endpoint obstacles for every connection start/end point.
+    // These ensure that pad endpoints are blocked for all OTHER traces, while
+    // being excluded (via connectedTo) when routing the owning trace.
+    const endpointClearance = this.minTraceWidth / 2 + this.margin
+    for (const conn of params.srj.connections) {
+      const pts = conn.pointsToConnect
+      const connNames = [conn.name]
+      if (conn.rootConnectionName && conn.rootConnectionName !== conn.name) {
+        connNames.push(conn.rootConnectionName)
+      }
+      const connStr = connNames.join(",")
+      for (const pt of [pts[0]!, pts[pts.length - 1]!]) {
+        const layerZ = this.connectionPointToLayerZ(pt)
+        if (layerZ >= this.layerCount) continue
+        const poly = GreedySequentialPathSolver.makeOctagon(
+          pt.x,
+          pt.y,
+          endpointClearance,
+        )
+        this.rectObstacles[layerZ]!.push(poly)
+        // Track connectedTo for this endpoint obstacle so it gets excluded
+        // when routing its own connection
+        if (this.baseObstacleConnectedTo[layerZ]) {
+          this.baseObstacleConnectedTo[layerZ]!.push(connStr)
+        }
+        if (this.baseObstaclePolygons[layerZ]) {
+          this.baseObstaclePolygons[layerZ]!.push(poly)
+        }
+      }
+    }
+
     this.baseObstacleCount = this.rectObstacles.map((polys) => polys.length)
     this.connectionMeshCache = Array.from(
       { length: this.layerCount },
@@ -986,58 +1018,20 @@ export class GreedySequentialPathSolver extends BaseSolver {
       }
     }
 
-    // Add semicircular endcaps so the obstacle polygon fully covers the
-    // capsule-shaped collision bounds at both ends of the trace.
-    // Without these the polygon has flat endcaps and leaves small triangular
-    // gaps at the trace tips.
-    const CAP_SEGMENTS = 5 // number of arc segments per semicircle
-    const addSemicircle = (
-      center: Point,
-      /** unit direction pointing "outward" from the polyline end */
-      dx: number,
-      dy: number,
-      appendTo: Point[],
-    ) => {
-      // nx,ny = left normal of direction (dx,dy)
-      const nx = -dy
-      const ny = dx
-      // Sweep from +normal through forward direction to -normal
-      for (let k = 0; k <= CAP_SEGMENTS; k++) {
-        const angle = (Math.PI * k) / CAP_SEGMENTS - Math.PI / 2
-        const px =
-          center.x + (Math.cos(angle) * dx - Math.sin(angle) * dy) * clearance
-        const py =
-          center.y + (Math.sin(angle) * dx + Math.cos(angle) * dy) * clearance
-        appendTo.push({ x: px, y: py })
-      }
-    }
+    // Form the main polygon with flat endcaps (left forward, right reversed).
+    const polygon: Point[] = [...left, ...right.reverse()]
 
-    // End cap: semicircle at the last point, sweeping from left→forward→right
-    const lastPt = pts[pts.length - 1]!
-    const lastSeg = normals[normals.length - 1]!
-    // Direction of the last segment (forward)
-    const ldx = pts[pts.length - 1]!.x - pts[pts.length - 2]!.x
-    const ldy = pts[pts.length - 1]!.y - pts[pts.length - 2]!.y
-    const llen = Math.hypot(ldx, ldy)
-    const endCap: Point[] = []
-    if (llen > 1e-9) {
-      addSemicircle(lastPt, ldx / llen, ldy / llen, endCap)
-    }
-
-    // Start cap: semicircle at the first point, sweeping backward
+    // Add full-circle (octagonal) endcap polygons as separate obstacles at
+    // both endpoints.  Using full closed octagons (not semicircular arcs
+    // seamed into the main polygon) eliminates floating-point gaps at the
+    // seam when obstacles are merged by mergeOverlappingRects.
+    const result: Point[][] = [polygon]
     const firstPt = pts[0]!
-    const fdx = pts[0]!.x - pts[1]!.x // backward direction
-    const fdy = pts[0]!.y - pts[1]!.y
-    const flen = Math.hypot(fdx, fdy)
-    const startCap: Point[] = []
-    if (flen > 1e-9) {
-      addSemicircle(firstPt, fdx / flen, fdy / flen, startCap)
-    }
+    const lastPt = pts[pts.length - 1]!
+    result.push(GreedySequentialPathSolver.makeOctagon(firstPt.x, firstPt.y, clearance))
+    result.push(GreedySequentialPathSolver.makeOctagon(lastPt.x, lastPt.y, clearance))
 
-    // Form closed polygon: left side → end cap → right side reversed → start cap
-    const polygon: Point[] = [...left, ...endCap, ...right.reverse(), ...startCap]
-
-    return [polygon]
+    return result
   }
 
   /**
@@ -1069,6 +1063,16 @@ export class GreedySequentialPathSolver extends BaseSolver {
   }
 
   /** Extract base net name: "source_net_3_mst0" → "source_net_3" */
+  /** 8-sided approximation of a circle — cheap for CDT but blocks the area. */
+  private static makeOctagon(cx: number, cy: number, r: number): Point[] {
+    const pts: Point[] = []
+    for (let k = 0; k < 8; k++) {
+      const angle = (Math.PI * 2 * k) / 8
+      pts.push({ x: cx + Math.cos(angle) * r, y: cy + Math.sin(angle) * r })
+    }
+    return pts
+  }
+
   private static baseNetName(connectionName: string): string {
     const m = connectionName.match(/^(.+?)_mst\d+$/)
     return m ? m[1]! : connectionName
