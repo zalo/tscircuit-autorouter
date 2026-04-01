@@ -1343,6 +1343,11 @@ export class GreedySequentialPathSolver extends BaseSolver {
     return { cost: r.cost, path: r.path }
   }
 
+  /** Max connections to attempt CDT + pathfinding for per pickBestOnLayer call.
+   *  Pre-sorted by Euclidean distance so we try the most promising first.
+   *  Keeps total CDT builds at O(N × K) instead of O(N²). */
+  private static MAX_CANDIDATES_PER_PICK = 5
+
   /**
    * Pick the best connection to route on a specific layer.
    * Returns index into remaining, or -1 if nothing is routable.
@@ -1363,8 +1368,30 @@ export class GreedySequentialPathSolver extends BaseSolver {
     let bestStart: Point | null = null
     let bestEnd: Point | null = null
 
-    for (let i = 0; i < this.remaining.length; i++) {
-      const c = this.remaining[i]!
+    // Pre-sort candidates by Euclidean distance (cheap heuristic) so we
+    // only attempt expensive CDT + pathfinding for the most promising ones.
+    // This reduces CDT builds from O(N) per step to O(K) per step.
+    const candidates = this.remaining.map((c, i) => ({
+      idx: i,
+      conn: c,
+      euclidean: Math.hypot(
+        c.originalEnd.x - c.originalStart.x,
+        c.originalEnd.y - c.originalStart.y,
+      ),
+    }))
+    candidates.sort((a, b) =>
+      pickShortest
+        ? a.euclidean - b.euclidean
+        : b.euclidean - a.euclidean,
+    )
+
+    const limit = Math.min(
+      candidates.length,
+      GreedySequentialPathSolver.MAX_CANDIDATES_PER_PICK,
+    )
+
+    for (let ci = 0; ci < candidates.length; ci++) {
+      const { idx: i, conn: c } = candidates[ci]!
 
       // Check if vias are needed at start/end for this layer
       const needStartVia = c.startLayerZ !== layerZ
@@ -1373,11 +1400,13 @@ export class GreedySequentialPathSolver extends BaseSolver {
       let foundForThis = false
       const baseNet = GreedySequentialPathSolver.baseNetName(c.name)
 
+      // Stop after K candidates if we already found at least one valid path.
+      // Continue beyond K only if nothing has been found yet (to avoid
+      // returning -1 when a route does exist further down the list).
+      if (ci >= limit && bestIdx >= 0) break
+
       // -----------------------------------------------------------------
-      // Strategy 1: Direct routing.  Try the global mesh first (cheapest).
-      // Only fall back to building a connection-specific mesh (expensive
-      // CDT rebuild) if the global mesh can't find a path — typically
-      // because the start/end point is inside a connected obstacle.
+      // Strategy 1: Direct routing with own-net obstacles excluded.
       // -----------------------------------------------------------------
       if (!needStartVia && !needEndVia) {
         // Build a mesh with own-net obstacles excluded so pathfinder can
