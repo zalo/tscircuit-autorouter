@@ -633,6 +633,8 @@ export class GreedySequentialPathSolver extends BaseSolver {
     // merged into adjacent pad obstacles by mergeOverlappingRects, losing
     // their individual identity.  So we directly unblock any CDT obstacle
     // polygon whose centroid is within endpointClearance of the endpoint.
+    // Use batch API to avoid rebuilding vertex adjacency per-obstacle.
+    // One rebuild at the end is much faster than N rebuilds.
     const endpointR = (this.minTraceWidth / 2 + this.margin) / Math.cos(Math.PI / 8)
     const toggled = new Set<number>()
 
@@ -641,7 +643,6 @@ export class GreedySequentialPathSolver extends BaseSolver {
         const poly = mesh.polygons[pi]!
         if (poly.obstacleIndex < 0) continue
         if (toggled.has(poly.obstacleIndex)) continue
-        // Check if polygon centroid is within radius of endpoint
         let cx = 0, cy = 0
         for (const vi of poly.vertices) {
           cx += mesh.vertices[vi]!.p.x
@@ -650,29 +651,26 @@ export class GreedySequentialPathSolver extends BaseSolver {
         cx /= poly.vertices.length
         cy /= poly.vertices.length
         if (Math.hypot(cx - pt.x, cy - pt.y) < endpointR * 1.5) {
-          mesh.setObstacleBlocked(poly.obstacleIndex, blocked)
+          mesh.setObstacleBlockedBatch(poly.obstacleIndex, blocked)
           toggled.add(poly.obstacleIndex)
         }
       }
     }
 
-    // Toggle same-net trace obstacles (for multi-segment net routing).
-    // Use connMap if available, plus scan tracePolyNetNames directly.
+    // Same-net trace obstacles
     const connMap = this.connObstacleIndices[layerZ]
     if (connMap) {
       const netIndices = connMap.get(baseNet)
       if (netIndices) {
         for (const idx of netIndices) {
           if (!toggled.has(idx)) {
-            mesh.setObstacleBlocked(idx, blocked)
+            mesh.setObstacleBlockedBatch(idx, blocked)
             toggled.add(idx)
           }
         }
       }
     }
 
-    // Also scan mesh directly for obstacle polygons matching same-net
-    // trace obstacle centroids (catches small traces missed by CDT indexing)
     const traceNets = this.tracePolyNetNames[layerZ]!
     const tracePolys = this.tracePolygonObstacles[layerZ]!
     for (let i = 0; i < traceNets.length; i++) {
@@ -681,7 +679,6 @@ export class GreedySequentialPathSolver extends BaseSolver {
       let tcx = 0, tcy = 0
       for (const p of tp) { tcx += p.x; tcy += p.y }
       tcx /= tp.length; tcy /= tp.length
-      // Find mesh polygons near this trace obstacle centroid
       for (let pi = 0; pi < mesh.polygons.length; pi++) {
         const poly = mesh.polygons[pi]!
         if (poly.obstacleIndex < 0 || toggled.has(poly.obstacleIndex)) continue
@@ -693,11 +690,14 @@ export class GreedySequentialPathSolver extends BaseSolver {
         cx /= poly.vertices.length
         cy /= poly.vertices.length
         if (Math.hypot(cx - tcx, cy - tcy) < endpointR * 2) {
-          mesh.setObstacleBlocked(poly.obstacleIndex, blocked)
+          mesh.setObstacleBlockedBatch(poly.obstacleIndex, blocked)
           toggled.add(poly.obstacleIndex)
         }
       }
     }
+
+    // Single rebuild at the end (was N rebuilds before)
+    mesh.finishBlockedChanges()
   }
 
   /** Quick check: does this connection have any obstacles that would be
