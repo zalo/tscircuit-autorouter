@@ -82,7 +82,14 @@ export class GreedySequentialPipelineSolver extends BaseSolver {
         srj: pps.srjWithPointPairs ?? pps.srj,
         colorMap: pps.colorMap,
         minTraceWidth: pps.minTraceWidth,
-        margin: pps.srj.defaultObstacleMargin ?? pps.minTraceWidth,
+        // Margin from raw obstacle edge to CDT obstacle boundary.
+        // The trace centerline routes along the CDT boundary, so the trace
+        // EDGE is (margin - traceWidth/2) from the obstacle.  For DRC to
+        // pass, this gap must be > traceWidth/2.  Adding traceWidth/2 to
+        // the base margin ensures the gap is at least traceWidth.
+        margin:
+          (pps.srj.defaultObstacleMargin ?? pps.minTraceWidth) +
+          pps.minTraceWidth / 2,
       },
     ]),
     definePipelineStep("outputSolver", PolyanyaOutputSolver, (pps) => {
