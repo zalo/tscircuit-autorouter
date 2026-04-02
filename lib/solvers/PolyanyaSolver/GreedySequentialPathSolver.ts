@@ -96,8 +96,8 @@ export class GreedySequentialPathSolver extends BaseSolver {
   /** Per-layer rect obstacle polygons (base rects + via rects, merged before CDT) */
   private rectObstacles: Point[][][] = []
 
-  /** Per-layer: connectedTo names for each base obstacle polygon (parallel to baseObstaclePolygons) */
-  private baseObstacleConnectedTo: string[][] = []
+  /** Per-layer: connectedTo name arrays for each base obstacle polygon (parallel to baseObstaclePolygons) */
+  private baseObstacleConnectedTo: string[][][] = []
 
   /** Per-layer: how many entries at the start of rectObstacles[z] are base obstacles */
   private baseObstacleCount: number[] = []
@@ -265,9 +265,7 @@ export class GreedySequentialPathSolver extends BaseSolver {
         [...obs.connectedTo],
       )
       this.baseObstaclePolygons.push(expandedPolygons)
-      this.baseObstacleConnectedTo.push(
-        connectedToNames.map((names) => names.join(",")),
-      )
+      this.baseObstacleConnectedTo.push(connectedToNames)
     }
 
     // Initialize per-layer state (only for active layers)
@@ -290,7 +288,6 @@ export class GreedySequentialPathSolver extends BaseSolver {
       if (conn.rootConnectionName && conn.rootConnectionName !== conn.name) {
         connNames.push(conn.rootConnectionName)
       }
-      const connStr = connNames.join(",")
       for (const pt of [pts[0]!, pts[pts.length - 1]!]) {
         const layerZ = this.connectionPointToLayerZ(pt)
         if (layerZ >= this.layerCount) continue
@@ -303,7 +300,7 @@ export class GreedySequentialPathSolver extends BaseSolver {
         // Track connectedTo for this endpoint obstacle so it gets excluded
         // when routing its own connection
         if (this.baseObstacleConnectedTo[layerZ]) {
-          this.baseObstacleConnectedTo[layerZ]!.push(connStr)
+          this.baseObstacleConnectedTo[layerZ]!.push([...connNames])
         }
         if (this.baseObstaclePolygons[layerZ]) {
           this.baseObstaclePolygons[layerZ]!.push(poly)
@@ -540,44 +537,21 @@ export class GreedySequentialPathSolver extends BaseSolver {
       const baseCount = this.baseObstacleCount[layerZ] ?? 0
       const rects = this.rectObstacles[layerZ]!
 
-      // Build a mapping from CDT obstacle index → connStr by checking which
-      // base obstacle (from the unmerged rectObstacles) each CDT obstacle
-      // centroid falls inside.
-      const obstIdxToConnStr = new Map<number, string>()
+      // Map CDT obstacle index → net name for trace obstacles.
+      // Base obstacle matching is handled by endpoint proximity toggling.
       for (const obsIdx of mesh.getObstacleIndices()) {
         if (obsIdx < 0 || obsIdx >= allObstacles.length) continue
-        const poly = allObstacles[obsIdx]!
-        // Centroid of the CDT obstacle polygon
-        let cx = 0, cy = 0
-        for (const p of poly) { cx += p.x; cy += p.y }
-        cx /= poly.length; cy /= poly.length
-
-        // Match against unmerged base obstacles using connectedTo
-        if (connectedToList) {
-          for (let bi = 0; bi < baseCount && bi < connectedToList.length; bi++) {
-            const basePoly = rects[bi]!
-            if (this.pointInPolygon(cx, cy, basePoly)) {
-              obstIdxToConnStr.set(obsIdx, connectedToList[bi]!)
-              break
-            }
-          }
-        }
-        // Also match trace polygon obstacles by net name
         const tracePolyOffset = mergedRects.length
         if (obsIdx >= tracePolyOffset) {
           const tpIdx = obsIdx - tracePolyOffset
           const traceNets = this.tracePolyNetNames[layerZ]!
           if (tpIdx < traceNets.length) {
-            obstIdxToConnStr.set(obsIdx, traceNets[tpIdx]!)
+            const netName = traceNets[tpIdx]!
+            let arr = map.get(netName)
+            if (!arr) { arr = []; map.set(netName, arr) }
+            arr.push(obsIdx)
           }
         }
-      }
-
-      // Group obstacle indices by connStr
-      for (const [obsIdx, connStr] of obstIdxToConnStr) {
-        let arr = map.get(connStr)
-        if (!arr) { arr = []; map.set(connStr, arr) }
-        arr.push(obsIdx)
       }
       this.connObstacleIndices[layerZ] = map
 
@@ -739,8 +713,8 @@ export class GreedySequentialPathSolver extends BaseSolver {
     const baseCount = this.baseObstacleCount[layerZ] ?? 0
     if (connectedToList) {
       for (let i = 0; i < baseCount; i++) {
-        const obsConnStr = connectedToList[i]!
-        if (connNames.some((cn) => obsConnStr.includes(cn))) return true
+        const obsConnArr = connectedToList[i]!
+        if (connNames.some((cn) => obsConnArr.includes(cn))) return true
       }
     }
     // Check same-net trace obstacles
@@ -773,9 +747,10 @@ export class GreedySequentialPathSolver extends BaseSolver {
     const filteredRects: Point[][] = []
     for (let i = 0; i < rects.length; i++) {
       if (i < baseCount && connectedToList) {
-        // This is a base obstacle — check if any connName appears in its connectedTo
-        const obsConnStr = connectedToList[i]!
-        const exclude = connNames.some((cn) => obsConnStr.includes(cn))
+        // This is a base obstacle — check if any connName matches an entry
+        // in its connectedTo array (exact element match, not substring)
+        const obsConnArr = connectedToList[i]!
+        const exclude = connNames.some((cn) => obsConnArr.includes(cn))
         if (exclude) continue
       }
       filteredRects.push(rects[i]!)
@@ -1739,6 +1714,29 @@ export class GreedySequentialPathSolver extends BaseSolver {
     // on the same layer before returning.  This catches CDT leaks where
     // the pathfinder routes through free-space gaps in obstacle polygons.
     // -------------------------------------------------------------------
+    // Helper: check if any point on the path is inside an unconnected obstacle
+    const pathPenetratesObstacle = (path: Point[], connNames: string[]): boolean => {
+      for (let i = 0; i < path.length - 1; i++) {
+        const a = path[i]!
+        const b = path[i + 1]!
+        for (let s = 0; s <= 5; s++) {
+          const t = s / 5
+          const px = a.x + (b.x - a.x) * t
+          const py = a.y + (b.y - a.y) * t
+          for (const obs of this.srj.obstacles) {
+            // Skip connected obstacles
+            if (connNames.some((cn) => obs.connectedTo.includes(cn))) continue
+            const hw = obs.width / 2
+            const hh = obs.height / 2
+            if (Math.abs(px - obs.center.x) < hw && Math.abs(py - obs.center.y) < hh) {
+              return true
+            }
+          }
+        }
+      }
+      return false
+    }
+
     // Helper: check if a candidate path crosses any committed trace on this layer
     const pathCrosses = (path: Point[], exemptNet: string): boolean => {
       for (let i = 0; i < path.length - 1; i++) {
@@ -1780,11 +1778,12 @@ export class GreedySequentialPathSolver extends BaseSolver {
         // (different mesh topology — no obstacle holes at endpoints)
         const toggleFailed = r.cost < 0 || r.path.length === 0
         const toggleCrosses = !toggleFailed && pathCrosses(r.path, baseNet)
-        if ((toggleFailed || toggleCrosses) && this.useOccupancyToggle) {
+        const togglePenetrates = !toggleFailed && !toggleCrosses && pathPenetratesObstacle(r.path, c.connNames)
+        if ((toggleFailed || toggleCrosses || togglePenetrates) && this.useOccupancyToggle) {
           const connMesh = this.buildMeshExcluding(layerZ, c.connNames)
           if (connMesh) r = this.searchPolyanya(connMesh, c.originalStart, c.originalEnd)
         }
-        if (r.cost >= 0 && r.path.length > 0 && !pathCrosses(r.path, baseNet)) {
+        if (r.cost >= 0 && r.path.length > 0 && !pathCrosses(r.path, baseNet) && !pathPenetratesObstacle(r.path, c.connNames)) {
           this.remaining[cand.idx]!.start = c.originalStart
           this.remaining[cand.idx]!.end = c.originalEnd
           return { idx: cand.idx, path: r.path }
@@ -1805,7 +1804,7 @@ export class GreedySequentialPathSolver extends BaseSolver {
           const connMesh = this.buildMeshExcluding(layerZ, c.connNames) ?? mesh
           r = this.searchPolyanya(connMesh, cand.effectiveS, cand.effectiveE)
         }
-        if (r.cost >= 0 && r.path.length > 0 && !pathCrosses(r.path, baseNet)) {
+        if (r.cost >= 0 && r.path.length > 0 && !pathCrosses(r.path, baseNet) && !pathPenetratesObstacle(r.path, c.connNames)) {
           this.remaining[cand.idx]!.start = cand.effectiveS
           this.remaining[cand.idx]!.end = cand.effectiveE
           return { idx: cand.idx, path: r.path }
