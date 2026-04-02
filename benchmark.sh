@@ -7,7 +7,22 @@ EFFORT=""
 SAMPLE_TIMEOUT=""
 INCLUDE_ASSIGNABLE=false
 DATASET="dataset01"
-DEFAULT_SOLVER_NAME="AutoroutingPipelineSolver"
+DEFAULT_SOLVER_NAME="AutoroutingPipelineSolver4"
+PIPELINE_ID=""
+
+resolve_pipeline_solver_name() {
+  case "$1" in
+    1) echo "AutoroutingPipeline1_OriginalUnravel" ;;
+    2) echo "AutoroutingPipelineSolver2_PortPointPathing" ;;
+    3) echo "AutoroutingPipelineSolver3_HgPortPointPathing" ;;
+    4) echo "AutoroutingPipelineSolver4" ;;
+    5) echo "AutoroutingPipelineSolver5" ;;
+    *)
+      echo "Unknown pipeline: $1" >&2
+      exit 1
+      ;;
+  esac
+}
 
 default_concurrency() {
   getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4
@@ -22,17 +37,25 @@ get_solvers() {
 
     // Use autorouter-pipelines/index.ts as the source of truth for benchmarkable solvers
     const pipelinesIndex = readFileSync(join(process.cwd(), "lib", "autorouter-pipelines", "index.ts"), "utf8")
-    const pipelineNames = [...pipelinesIndex.matchAll(/export\s*\{\s*(\w+)\s*\}/g)].map(m => m[1])
+    const pipelineNames = new Set()
+    for (const match of pipelinesIndex.matchAll(/export\s*\{([\s\S]*?)\}\s*from/g)) {
+      const exportEntries = match[1].split(",").map((entry) => entry.trim()).filter(Boolean)
+      for (const entry of exportEntries) {
+        const localName = entry.split(/\s+as\s+/)[0]?.trim()
+        if (localName) pipelineNames.add(localName)
+      }
+    }
 
     // Resolve aliases from lib/index.ts
     const libIndex = readFileSync(join(process.cwd(), "lib", "index.ts"), "utf8")
-    const solvers = pipelineNames.map(name => {
-      const aliasMatch = libIndex.match(new RegExp(name + "\\s+as\\s+(\\w+)"))
-      return aliasMatch ? aliasMatch[1] : name
+    const solvers = [...pipelineNames].flatMap(name => {
+      const aliasMatches = [...libIndex.matchAll(new RegExp(name + "\\s+as\\s+(\\w+)", "g"))].map(match => match[1])
+      return [name, ...aliasMatches]
     })
+    const uniqueSolvers = [...new Set(solvers)]
 
     const includeAssignable = process.env.INCLUDE_ASSIGNABLE === "true"
-    const filtered = includeAssignable ? solvers : solvers.filter(name => !name.includes("Assignable"))
+    const filtered = includeAssignable ? uniqueSolvers : uniqueSolvers.filter(name => !name.includes("Assignable"))
 
     console.log(filtered.join("\n"))
   ' 2>/dev/null || true
@@ -42,30 +65,34 @@ print_help() {
   cat <<'EOF'
 Usage:
   ./benchmark.sh [solver-name|all] [scenario-limit] [--concurrency N] [--effort N] [--sample-timeout DURATION] [--dataset NAME] [--include-assignable]
-  ./benchmark.sh [--solver NAME] [--scenario-limit N] [--concurrency N] [--effort N] [--sample-timeout DURATION] [--dataset NAME] [--include-assignable]
+  ./benchmark.sh [--solver NAME] [--pipeline N] [--scenario-limit N] [--concurrency N] [--effort N] [--sample-timeout DURATION] [--dataset NAME] [--include-assignable]
 
 Options:
   --solver NAME        Run only one solver (same as first positional arg)
+  --pipeline N         Run a numbered pipeline alias (1-5)
   --scenario-limit N   Run only first N scenarios (same as second positional arg)
   --concurrency N      Number of Bun workers used per solver, or "auto"
   --effort N           Override scenario effort multiplier
   --sample-timeout D   Override per-sample timeout directly; otherwise timeout is 60s + 60s * effort
-  --dataset NAME       Dataset to benchmark: dataset01 (default) or zdwiel
+  --dataset NAME       Dataset to benchmark: dataset01 (default), zdwiel, or srj05
   --include-assignable Include assignable pipelines (excluded by default)
   -h, --help           Show this help
 
 Defaults:
-  Running ./benchmark.sh with no parameters benchmarks only AutoroutingPipelineSolver.
+  Running ./benchmark.sh with no parameters benchmarks only AutoroutingPipelineSolver4.
   Use "all" to benchmark every available solver.
 
 Examples:
   ./benchmark.sh
-  ./benchmark.sh AutoroutingPipelineSolver
+  ./benchmark.sh AutoroutingPipelineSolver4
   ./benchmark.sh all 20 --concurrency auto
-  ./benchmark.sh --solver AutoroutingPipelineSolver --effort 2
-  ./benchmark.sh --solver AutoroutingPipelineSolver --sample-timeout 90s
-  ./benchmark.sh --solver AutoroutingPipelineSolver --scenario-limit 20
-  ./benchmark.sh --solver AutoroutingPipelineSolver --dataset zdwiel --scenario-limit 20
+  ./benchmark.sh --solver AutoroutingPipelineSolver4 --effort 2
+  ./benchmark.sh --solver AutoroutingPipelineSolver4 --sample-timeout 90s
+  ./benchmark.sh --solver AutoroutingPipelineSolver4 --scenario-limit 20
+  ./benchmark.sh --solver AutoroutingPipelineSolver4 --dataset zdwiel --scenario-limit 20
+  ./benchmark.sh --pipeline 4
+  ./benchmark.sh --pipeline 5
+  ./benchmark.sh --solver AutoroutingPipelineSolver4 --dataset srj05 --scenario-limit 20
   ./benchmark.sh --include-assignable
 EOF
 
@@ -99,6 +126,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --solver)
       SOLVER_NAME="${2:-}"
+      shift 2
+      ;;
+    --pipeline)
+      PIPELINE_ID="${2:-}"
       shift 2
       ;;
     --scenario-limit)
@@ -135,6 +166,10 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ -n "$PIPELINE_ID" ]; then
+  SOLVER_NAME="$(resolve_pipeline_solver_name "$PIPELINE_ID")"
+fi
 
 CMD=(bun "scripts/benchmark/index.ts" "--concurrency" "$CONCURRENCY")
 

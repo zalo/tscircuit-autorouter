@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { MetricsCard } from "./capacity-node-editor/MetricsCard"
 import { PortPoint } from "./capacity-node-editor/PortPoint"
 import { LAYER_COLORS, SCALE } from "./capacity-node-editor/constants"
+import { getInitialCapacityNodeEditorView } from "./capacity-node-editor/getInitialCapacityNodeEditorView"
 import {
   findEdgeAndT,
   getPointOnEdge,
@@ -64,7 +65,10 @@ export default function CapacityNodeEditor({
   const [selected, setSelected] = useState<SelectionState | null>(null)
   const [layerInput, setLayerInput] = useState("")
   const [panOffset, setPanOffset] = useState({ x: 0, y: 0 })
+  const [pixelsPerMm, setPixelsPerMm] = useState(SCALE)
+  const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 })
   const svgRef = useRef<SVGSVGElement>(null)
+  const hasAppliedInitialViewRef = useRef(false)
   // Via state: UI-only for visualization/diagnostics. Not fed into actual solver.
   // These allow manual via placement to verify solvability predictions visually.
   const [viaMode, setViaMode] = useState(false)
@@ -74,132 +78,160 @@ export default function CapacityNodeEditor({
   // traceWidth: default from HighDensitySolver (0.15mm)
   const traceWidth = 0.15
 
+  useEffect(() => {
+    hasAppliedInitialViewRef.current = false
+  }, [initialNode])
+
+  useEffect(() => {
+    const svg = svgRef.current
+    if (!svg) return
+
+    const updateViewportSize = (width: number, height: number) => {
+      if (width <= 0 || height <= 0) return
+      setViewportSize({ width, height })
+    }
+
+    const initialRect = svg.getBoundingClientRect()
+    updateViewportSize(initialRect.width, initialRect.height)
+
+    if (typeof ResizeObserver === "undefined") return
+
+    const resizeObserver = new ResizeObserver((entries) => {
+      const entry = entries[0]
+      if (!entry) return
+      updateViewportSize(entry.contentRect.width, entry.contentRect.height)
+    })
+
+    resizeObserver.observe(svg)
+    return () => resizeObserver.disconnect()
+  }, [])
+
   // Initialize from initialNode
   useEffect(() => {
     if (initialNode) {
-      // 1. Set Rect
-      // Center the node in screen (assuming typical screen offset or centering)
-      // We'll keep x, y at 150, 80 default offset for now, or assume node center was 0,0
-      // If we want to center on screen:
-      const screenCenterX = 150 + (1 * SCALE) / 2 // Default center X
-      const screenCenterY = 80 + (1 * SCALE) / 2 // Default center Y
+      if (
+        !hasAppliedInitialViewRef.current &&
+        viewportSize.width > 0 &&
+        viewportSize.height > 0
+      ) {
+        const initialView = getInitialCapacityNodeEditorView({
+          nodeWithPortPoints: initialNode,
+          viewportWidth: viewportSize.width,
+          viewportHeight: viewportSize.height,
+        })
 
-      const newWidth = initialNode.width * SCALE
-      const newHeight = initialNode.height * SCALE
+        setPixelsPerMm(initialView.pixelsPerMm)
+        setRect(initialView.rect)
+        setPanOffset({ x: 0, y: 0 })
+        // 2. Set Pairs
+        // Group ports by connectionName
+        const groupedPorts: Record<string, typeof initialNode.portPoints> = {}
+        initialNode.portPoints.forEach((p) => {
+          if (!groupedPorts[p.connectionName])
+            groupedPorts[p.connectionName] = []
+          groupedPorts[p.connectionName].push(p)
+        })
 
-      const newRect = {
-        x: screenCenterX - newWidth / 2,
-        y: screenCenterY - newHeight / 2,
-        width: newWidth,
-        height: newHeight,
-      }
+        const newPairs: PairDef[] = []
+        Object.values(groupedPorts).forEach((ports) => {
+          if (ports.length >= 2) {
+            // Naive pairing: first is entry, second is exit.
+            // If > 2, we might need multiple pairs or advanced logic.
+            // Assuming pairs for now.
+            const entryPort = ports[0]
+            const exitPort = ports[1] // Or find furthest?
 
-      setRect(newRect)
+            // Helper to find edge/t
+            const mapPortToEditorPoint = (
+              p: (typeof initialNode.portPoints)[0],
+            ): PointDef => {
+              const halfW = initialNode.width / 2
+              const halfH = initialNode.height / 2
+              // Convert absolute coordinates to relative to node center
+              // Assuming initialNode.center is present and valid
+              const centerX = initialNode.center?.x ?? 0
+              const centerY = initialNode.center?.y ?? 0
+              const px = p.x - centerX
+              const py = p.y - centerY
+              const EPS = 1e-6 // Tolerance for floating point comparisons
 
-      // 2. Set Pairs
-      // Group ports by connectionName
-      const groupedPorts: Record<string, typeof initialNode.portPoints> = {}
-      initialNode.portPoints.forEach((p) => {
-        if (!groupedPorts[p.connectionName]) groupedPorts[p.connectionName] = []
-        groupedPorts[p.connectionName].push(p)
-      })
+              let edge: Edge = "top"
+              let t = 0.5
 
-      const newPairs: PairDef[] = []
-      Object.values(groupedPorts).forEach((ports) => {
-        if (ports.length >= 2) {
-          // Naive pairing: first is entry, second is exit.
-          // If > 2, we might need multiple pairs or advanced logic.
-          // Assuming pairs for now.
-          const entryPort = ports[0]
-          const exitPort = ports[1] // Or find furthest?
-
-          // Helper to find edge/t
-          const mapPortToEditorPoint = (
-            p: (typeof initialNode.portPoints)[0],
-          ): PointDef => {
-            const halfW = initialNode.width / 2
-            const halfH = initialNode.height / 2
-            // Convert absolute coordinates to relative to node center
-            // Assuming initialNode.center is present and valid
-            const centerX = initialNode.center?.x ?? 0
-            const centerY = initialNode.center?.y ?? 0
-            const px = p.x - centerX
-            const py = p.y - centerY
-            const EPS = 1e-6 // Tolerance for floating point comparisons
-
-            let edge: Edge = "top"
-            let t = 0.5
-
-            if (Math.abs(py + halfH) < EPS) {
-              // Top edge (-y)
-              edge = "top"
-              t = (px + halfW) / initialNode.width
-            } else if (Math.abs(py - halfH) < EPS) {
-              // Bottom edge (+y)
-              edge = "bottom"
-              t = (px + halfW) / initialNode.width
-            } else if (Math.abs(px + halfW) < EPS) {
-              // Left edge (-x)
-              edge = "left"
-              t = (py + halfH) / initialNode.height
-            } else if (Math.abs(px - halfW) < EPS) {
-              // Right edge (+x)
-              edge = "right"
-              t = (py + halfH) / initialNode.height
-            } else {
-              // Fallback: project to nearest edge if not perfectly aligned
-              // This is a simplification. Real projection logic would be better.
-              // Just snapping to nearest edge logic:
-              const distTop = Math.abs(py + halfH)
-              const distBottom = Math.abs(py - halfH)
-              const distLeft = Math.abs(px + halfW)
-              const distRight = Math.abs(px - halfW)
-              const minDist = Math.min(distTop, distBottom, distLeft, distRight)
-
-              if (minDist === distTop) {
+              if (Math.abs(py + halfH) < EPS) {
+                // Top edge (-y)
                 edge = "top"
                 t = (px + halfW) / initialNode.width
-              } else if (minDist === distBottom) {
+              } else if (Math.abs(py - halfH) < EPS) {
+                // Bottom edge (+y)
                 edge = "bottom"
                 t = (px + halfW) / initialNode.width
-              } else if (minDist === distLeft) {
+              } else if (Math.abs(px + halfW) < EPS) {
+                // Left edge (-x)
                 edge = "left"
                 t = (py + halfH) / initialNode.height
-              } else {
+              } else if (Math.abs(px - halfW) < EPS) {
+                // Right edge (+x)
                 edge = "right"
                 t = (py + halfH) / initialNode.height
+              } else {
+                // Fallback: project to nearest edge if not perfectly aligned
+                const distTop = Math.abs(py + halfH)
+                const distBottom = Math.abs(py - halfH)
+                const distLeft = Math.abs(px + halfW)
+                const distRight = Math.abs(px - halfW)
+                const minDist = Math.min(
+                  distTop,
+                  distBottom,
+                  distLeft,
+                  distRight,
+                )
+
+                if (minDist === distTop) {
+                  edge = "top"
+                  t = (px + halfW) / initialNode.width
+                } else if (minDist === distBottom) {
+                  edge = "bottom"
+                  t = (px + halfW) / initialNode.width
+                } else if (minDist === distLeft) {
+                  edge = "left"
+                  t = (py + halfH) / initialNode.height
+                } else {
+                  edge = "right"
+                  t = (py + halfH) / initialNode.height
+                }
+              }
+
+              t = Math.max(0.05, Math.min(0.95, t))
+
+              return {
+                edge,
+                t,
+                layers: [p.z],
+                portPointId: p.portPointId,
               }
             }
 
-            // Clamp t
-            t = Math.max(0.05, Math.min(0.95, t))
+            const entryDef = mapPortToEditorPoint(entryPort)
+            const exitDef = mapPortToEditorPoint(exitPort)
 
-            return { edge, t, layers: [p.z], portPointId: p.portPointId } // Single layer per port, can merge if multiples exist at same pos
+            newPairs.push({ entry: entryDef, exit: exitDef })
           }
+        })
 
-          const entryDef = mapPortToEditorPoint(entryPort)
-          const exitDef = mapPortToEditorPoint(exitPort)
-
-          // Merge layers if other ports share same pos?
-          // For now, simple mapping.
-
-          newPairs.push({ entry: entryDef, exit: exitDef })
-        }
-      })
-
-      if (newPairs.length > 0) {
         setPairs(newPairs)
+        hasAppliedInitialViewRef.current = true
       }
     }
-  }, []) // Run once on mount (or when initialNode changes? User might want to reset)
+  }, [initialNode, viewportSize.width, viewportSize.height])
 
   // Sync state to parent
   useEffect(() => {
     if (!onNodeChange) return
 
     // Convert internal state to NodeWithPortPoints
-    const width = rect.width / SCALE
-    const height = rect.height / SCALE
+    const width = rect.width / pixelsPerMm
+    const height = rect.height / pixelsPerMm
     // const center = { x: 0, y: 0 };
 
     const svgCenterX = rect.x + rect.width / 2
@@ -210,10 +242,10 @@ export default function CapacityNodeEditor({
       const exitPos = getPointOnEdge(pair.exit.edge, pair.exit.t, rect)
 
       // Convert to node-relative coordinates (mm)
-      const entryX = (entryPos.x - svgCenterX) / SCALE
-      const entryY = (entryPos.y - svgCenterY) / SCALE
-      const exitX = (exitPos.x - svgCenterX) / SCALE
-      const exitY = (exitPos.y - svgCenterY) / SCALE
+      const entryX = (entryPos.x - svgCenterX) / pixelsPerMm
+      const entryY = (entryPos.y - svgCenterY) / pixelsPerMm
+      const exitX = (exitPos.x - svgCenterX) / pixelsPerMm
+      const exitY = (exitPos.y - svgCenterY) / pixelsPerMm
 
       const entryPorts = pair.entry.layers.map((layer) => ({
         x: entryX,
@@ -239,7 +271,7 @@ export default function CapacityNodeEditor({
       height,
       portPoints,
     })
-  }, [rect, pairs])
+  }, [rect, pairs, pixelsPerMm])
 
   useEffect(() => {
     if (selected) {
@@ -287,7 +319,7 @@ export default function CapacityNodeEditor({
         const { rect: startRect } = dragStart
         const { handle } = dragging.data
         const newRect = { ...startRect }
-        const minSize = 0.2 * SCALE
+        const minSize = 0.2 * pixelsPerMm
 
         if (handle.includes("left")) {
           const newWidth = Math.max(minSize, startRect.width - dx)
@@ -420,8 +452,8 @@ export default function CapacityNodeEditor({
     { name: "right", x: rect.x + rect.width, y: rect.y + rect.height / 2 },
   ]
 
-  const widthMm = (rect.width / SCALE).toFixed(2)
-  const heightMm = (rect.height / SCALE).toFixed(2)
+  const widthMm = (rect.width / pixelsPerMm).toFixed(2)
+  const heightMm = (rect.height / pixelsPerMm).toFixed(2)
   const selectedPoint = selected
     ? pairs[selected.pairIndex]?.[selected.pointType]
     : null
@@ -433,8 +465,8 @@ export default function CapacityNodeEditor({
 
   // Calculate metrics
   const metrics = useMemo(() => {
-    const widthMm = rect.width / SCALE
-    const heightMm = rect.height / SCALE
+    const widthMm = rect.width / pixelsPerMm
+    const heightMm = rect.height / pixelsPerMm
 
     const mockNode: any = {
       width: Math.min(widthMm, heightMm),
@@ -446,10 +478,10 @@ export default function CapacityNodeEditor({
     const portPoints = pairs.flatMap((pair, i) => {
       const entryPos = getPointOnEdge(pair.entry.edge, pair.entry.t, rect)
       const exitPos = getPointOnEdge(pair.exit.edge, pair.exit.t, rect)
-      const entryX = (entryPos.x - svgCenterX) / SCALE
-      const entryY = (entryPos.y - svgCenterY) / SCALE
-      const exitX = (exitPos.x - svgCenterX) / SCALE
-      const exitY = (exitPos.y - svgCenterY) / SCALE
+      const entryX = (entryPos.x - svgCenterX) / pixelsPerMm
+      const entryY = (entryPos.y - svgCenterY) / pixelsPerMm
+      const exitX = (exitPos.x - svgCenterX) / pixelsPerMm
+      const exitY = (exitPos.y - svgCenterY) / pixelsPerMm
       const entryPorts = pair.entry.layers.map((layer) => ({
         x: entryX,
         y: entryY,
@@ -485,14 +517,14 @@ export default function CapacityNodeEditor({
       ...diagnostics,
       probabilityOfFailure,
     }
-  }, [pairs, rect, viaDiameter, initialNode])
+  }, [pairs, rect, viaDiameter, initialNode, pixelsPerMm])
 
   // Transform solver coordinates to SVG coordinates
   const svgCenterX = rect.x + rect.width / 2
   const svgCenterY = rect.y + rect.height / 2
   const solverToSvg = (x: number, y: number) => ({
-    x: svgCenterX + x * SCALE,
-    y: svgCenterY + y * SCALE,
+    x: svgCenterX + x * pixelsPerMm,
+    y: svgCenterY + y * pixelsPerMm,
   })
 
   return (
@@ -659,8 +691,8 @@ export default function CapacityNodeEditor({
                     gRect.center.x - gRect.width / 2,
                     gRect.center.y - gRect.height / 2,
                   )
-                  const w = gRect.width * SCALE
-                  const h = gRect.height * SCALE
+                  const w = gRect.width * pixelsPerMm
+                  const h = gRect.height * pixelsPerMm
                   return (
                     <rect
                       key={`s-rect-${i}`}
@@ -689,7 +721,7 @@ export default function CapacityNodeEditor({
                       d={d}
                       fill="none"
                       stroke={gLine.strokeColor || "black"}
-                      strokeWidth={(gLine.strokeWidth || 0.1) * SCALE}
+                      strokeWidth={(gLine.strokeWidth || 0.1) * pixelsPerMm}
                     />
                   )
                 })}
@@ -749,7 +781,7 @@ export default function CapacityNodeEditor({
                 key={`via-${i}`}
                 cx={via.x}
                 cy={via.y}
-                r={(viaDiameter / 2) * SCALE}
+                r={(viaDiameter / 2) * pixelsPerMm}
                 fill="silver"
                 stroke="#fff"
                 strokeWidth={1}

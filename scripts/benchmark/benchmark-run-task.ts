@@ -12,7 +12,8 @@ type SolverInstance = {
   solved?: boolean
   failed?: boolean
   srjWithPointPairs?: SimpleRouteJson
-  solve: () => void
+  solve?: () => void | Promise<void>
+  solveAsync?: () => Promise<void>
   getOutputSimplifiedPcbTraces?: () => SimplifiedPcbTrace[]
 }
 
@@ -30,11 +31,19 @@ export const runTask = async (task: BenchmarkTask): Promise<WorkerResult> => {
   const SolverConstructor = getSolverConstructor(task.solverName)
   const solver = new SolverConstructor(task.scenario)
   const start = performance.now()
+  let solveError: string | undefined
 
   try {
-    solver.solve()
-  } catch {
+    if (typeof solver.solveAsync === "function") {
+      await solver.solveAsync()
+    } else if (typeof solver.solve === "function") {
+      await solver.solve()
+    } else {
+      throw new Error("Solver does not implement solve() or solveAsync()")
+    }
+  } catch (error) {
     solver.solved = false
+    solveError = error instanceof Error ? error.message : String(error)
   }
 
   const elapsedTimeMs = performance.now() - start
@@ -48,6 +57,7 @@ export const runTask = async (task: BenchmarkTask): Promise<WorkerResult> => {
       didSolve,
       didTimeout: false,
       relaxedDrcPassed: false,
+      error: solveError,
     }
   }
 

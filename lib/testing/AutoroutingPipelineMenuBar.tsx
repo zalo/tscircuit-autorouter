@@ -25,7 +25,7 @@ const cacheProviders: CacheProviderName[] = [
 
 export const EFFORT_LEVELS = [1, 2, 5, 10, 20, 50, 100] as const
 export type EffortLevel = (typeof EFFORT_LEVELS)[number]
-export const LAYER_OVERRIDE_OPTIONS = ["auto", 2, 4] as const
+export const LAYER_OVERRIDE_OPTIONS = ["auto", 1, 2, 4] as const
 export type LayerOverride = (typeof LAYER_OVERRIDE_OPTIONS)[number]
 
 export const PIPELINE_OPTIONS = [
@@ -40,6 +40,14 @@ export const PIPELINE_OPTIONS = [
   {
     id: "AutoroutingPipelineSolver3_HgPortPointPathing",
     label: "Pipeline3 Hypergraph Port Point Pathing",
+  },
+  {
+    id: "AutoroutingPipelineSolver4",
+    label: "Pipeline4 Tiny Hypergraph Port Point Pathing",
+  },
+  {
+    id: "AutoroutingPipelineSolver5",
+    label: "Pipeline5 HD Cache Port Point Pathing",
   },
   {
     id: "AssignableAutoroutingPipeline1Solver",
@@ -68,6 +76,13 @@ interface AutoroutingPipelineMenuBarProps {
   onSetCanSelectObjects: (canSelect: boolean) => void
   onRunDrcChecks: () => void
   onRunRelaxedDrcChecks: () => void
+  canTogglePcbSvg: boolean
+  pcbSvgEnabled: boolean
+  onTogglePcbSvg: () => void
+  autoSolve: boolean
+  onSetAutoSolve: (autoSolve: boolean) => void
+  autoRunDrc: boolean
+  onSetAutoRunDrc: (autoRunDrc: boolean) => void
   animationSpeed: number
   onSetAnimationSpeed: (speed: number) => void
   onSolveToBreakpointClick: () => void
@@ -93,6 +108,13 @@ export const AutoroutingPipelineMenuBar = ({
   onSetCanSelectObjects,
   onRunDrcChecks,
   onRunRelaxedDrcChecks,
+  canTogglePcbSvg,
+  pcbSvgEnabled,
+  onTogglePcbSvg,
+  autoSolve,
+  onSetAutoSolve,
+  autoRunDrc,
+  onSetAutoRunDrc,
   onSolveToBreakpointClick,
   cacheProviderName,
   cacheProvider,
@@ -199,9 +221,25 @@ export const AutoroutingPipelineMenuBar = ({
             Solve to Breakpoint
           </MenubarItem>
           <MenubarSeparator />
+          <MenubarItem onClick={() => onSetAutoSolve(!autoSolve)}>
+            Auto Solve
+            {autoSolve && <MenubarShortcut>✓</MenubarShortcut>}
+          </MenubarItem>
+          <MenubarItem onClick={() => onSetAutoRunDrc(!autoRunDrc)}>
+            Auto Run DRC
+            {autoRunDrc && <MenubarShortcut>✓</MenubarShortcut>}
+          </MenubarItem>
           <MenubarItem onClick={onRunDrcChecks}>Run DRC Checks</MenubarItem>
           <MenubarItem onClick={onRunRelaxedDrcChecks}>
             Run Relaxed DRC Checks
+          </MenubarItem>
+          <MenubarSeparator />
+          <MenubarItem
+            onClick={onTogglePcbSvg}
+            disabled={!canTogglePcbSvg && !pcbSvgEnabled}
+          >
+            Show PCB SVG
+            {pcbSvgEnabled && <MenubarShortcut>✓</MenubarShortcut>}
           </MenubarItem>
         </MenubarContent>
       </MenubarMenu>

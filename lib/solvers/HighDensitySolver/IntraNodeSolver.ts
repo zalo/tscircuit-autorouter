@@ -13,6 +13,25 @@ import { HighDensityHyperParameters } from "./HighDensityHyperParameters"
 import { SingleHighDensityRouteSolver } from "./SingleHighDensityRouteSolver"
 import { SingleHighDensityRouteSolver6_VertHorzLayer_FutureCost } from "./SingleHighDensityRouteSolver6_VertHorzLayer_FutureCost"
 
+type ConnectionPoint = { x: number; y: number; z: number }
+
+const pointKey = (point: ConnectionPoint) =>
+  `${point.x.toFixed(6)},${point.y.toFixed(6)},${point.z}`
+
+const dedupeConnectionPoints = (points: ConnectionPoint[]) => {
+  const seen = new Set<string>()
+  const deduped: ConnectionPoint[] = []
+
+  for (const point of points) {
+    const key = pointKey(point)
+    if (seen.has(key)) continue
+    seen.add(key)
+    deduped.push(point)
+  }
+
+  return deduped
+}
+
 export class IntraNodeRouteSolver extends BaseSolver {
   override getSolverName(): string {
     return "IntraNodeRouteSolver"
@@ -32,6 +51,7 @@ export class IntraNodeRouteSolver extends BaseSolver {
   minDistBetweenEnteringPoints: number
   viaDiameter: number
   traceWidth: number
+  obstacleMargin: number
 
   activeSubSolver: SingleHighDensityRouteSolver | null = null
   connMap?: ConnectivityMap
@@ -53,6 +73,7 @@ export class IntraNodeRouteSolver extends BaseSolver {
     connMap?: ConnectivityMap
     viaDiameter?: number
     traceWidth?: number
+    obstacleMargin?: number
   }) {
     const { nodeWithPortPoints, colorMap } = params
     super()
@@ -64,10 +85,8 @@ export class IntraNodeRouteSolver extends BaseSolver {
     this.connMap = params.connMap
     this.viaDiameter = params.viaDiameter ?? 0.3
     this.traceWidth = params.traceWidth ?? 0.15
-    const unsolvedConnectionsMap: Map<
-      string,
-      { x: number; y: number; z: number }[]
-    > = new Map()
+    this.obstacleMargin = params.obstacleMargin ?? 0.15
+    const unsolvedConnectionsMap: Map<string, ConnectionPoint[]> = new Map()
     for (const { connectionName, x, y, z } of nodeWithPortPoints.portPoints) {
       unsolvedConnectionsMap.set(connectionName, [
         ...(unsolvedConnectionsMap.get(connectionName) ?? []),
@@ -77,7 +96,7 @@ export class IntraNodeRouteSolver extends BaseSolver {
     this.unsolvedConnections = Array.from(
       unsolvedConnectionsMap.entries().map(([connectionName, points]) => ({
         connectionName,
-        points,
+        points: dedupeConnectionPoints(points),
       })),
     )
 
@@ -149,6 +168,106 @@ export class IntraNodeRouteSolver extends BaseSolver {
     )
   }
 
+  private getSingleRouteSolverOpts(unsolvedConnection: {
+    connectionName: string
+    points: { x: number; y: number; z: number }[]
+  }) {
+    const { connectionName, points } = unsolvedConnection
+    return {
+      connectionName,
+      minDistBetweenEnteringPoints: this.minDistBetweenEnteringPoints,
+      bounds: getBoundsFromNodeWithPortPoints(this.nodeWithPortPoints),
+      A: { x: points[0].x, y: points[0].y, z: points[0].z },
+      B: {
+        x: points[points.length - 1].x,
+        y: points[points.length - 1].y,
+        z: points[points.length - 1].z,
+      },
+      obstacleRoutes: this.connMap
+        ? this.solvedRoutes.filter(
+            (sr) =>
+              !this.connMap!.areIdsConnected(sr.connectionName, connectionName),
+          )
+        : this.solvedRoutes,
+      futureConnections: this.unsolvedConnections,
+      layerCount: this.nodeWithPortPoints.portPoints.reduce(
+        (max, p) => Math.max(max, (p.z ?? 0) + 1),
+        2,
+      ),
+      availableZ:
+        this.nodeWithPortPoints.availableZ &&
+        this.nodeWithPortPoints.availableZ.length > 0
+          ? this.nodeWithPortPoints.availableZ
+          : [
+              ...new Set(
+                this.nodeWithPortPoints.portPoints.map((point) => point.z ?? 0),
+              ),
+            ].sort((a, b) => a - b),
+      hyperParameters: this.hyperParameters,
+      connMap: this.connMap,
+      viaDiameter: this.viaDiameter,
+      traceThickness: this.traceWidth,
+      obstacleMargin: this.obstacleMargin,
+    }
+  }
+
+  private trySolveSamePointLayerChange(unsolvedConnection: {
+    connectionName: string
+    points: { x: number; y: number; z: number }[]
+  }) {
+    const opts = this.getSingleRouteSolverOpts(unsolvedConnection)
+    const obstacleChecker =
+      new SingleHighDensityRouteSolver6_VertHorzLayer_FutureCost(opts)
+    const { A, B } = opts
+    const viaPoint = { x: A.x, y: A.y }
+
+    if (!isEndpointViaSafe(obstacleChecker, viaPoint, A, B)) {
+      return false
+    }
+
+    const route = [
+      { x: A.x, y: A.y, z: A.z },
+      { ...viaPoint, z: A.z },
+      { ...viaPoint, z: B.z },
+      { x: B.x, y: B.y, z: B.z },
+    ].filter(
+      (pt, idx, arr) =>
+        idx === 0 ||
+        Math.abs(pt.x - arr[idx - 1].x) > 1e-6 ||
+        Math.abs(pt.y - arr[idx - 1].y) > 1e-6 ||
+        pt.z !== arr[idx - 1].z,
+    )
+
+    this.solvedRoutes.push({
+      connectionName: unsolvedConnection.connectionName,
+      traceThickness: this.traceWidth,
+      viaDiameter: this.viaDiameter,
+      route,
+      vias: [{ x: viaPoint.x, y: viaPoint.y }],
+    })
+    return true
+  }
+
+  private queueExtraBranchesForMultiPointConnection(unsolvedConnection: {
+    connectionName: string
+    points: { x: number; y: number; z: number }[]
+  }) {
+    const [origin, ...extraPoints] = dedupeConnectionPoints(
+      unsolvedConnection.points,
+    )
+
+    if (!origin || extraPoints.length <= 1) return false
+
+    for (const point of extraPoints) {
+      this.unsolvedConnections.push({
+        connectionName: unsolvedConnection.connectionName,
+        points: [origin, point],
+      })
+    }
+
+    return true
+  }
+
   _step() {
     if (this.activeSubSolver) {
       this.activeSubSolver.step()
@@ -174,6 +293,11 @@ export class IntraNodeRouteSolver extends BaseSolver {
     if (unsolvedConnection.points.length === 1) {
       return
     }
+    if (unsolvedConnection.points.length > 2) {
+      if (this.queueExtraBranchesForMultiPointConnection(unsolvedConnection)) {
+        return
+      }
+    }
     if (unsolvedConnection.points.length === 2) {
       const [A, B] = unsolvedConnection.points
       const sameX = Math.abs(A.x - B.x) < 1e-6
@@ -184,68 +308,17 @@ export class IntraNodeRouteSolver extends BaseSolver {
       }
 
       // Fast-path: if the points share the same x/y but differ in layer,
-      // we can directly create a vertical via-only route without invoking
-      // the heavier search-based solvers. This prevents the hyper solver
-      // from timing out on degenerate zero-length connections.
+      // prefer a pure via or a nearby obstacle-free via before invoking
+      // the heavier search-based solvers. This keeps the degenerate case
+      // fast, but avoids blindly routing through the node center.
       if (sameX && sameY && A.z !== B.z) {
-        const viaPoint = {
-          x: this.nodeWithPortPoints.center.x,
-          y: this.nodeWithPortPoints.center.y,
-        }
-        const route = [
-          { x: A.x, y: A.y, z: A.z },
-          { ...viaPoint, z: A.z },
-          { ...viaPoint, z: B.z },
-          { x: B.x, y: B.y, z: B.z },
-        ].filter(
-          (pt, idx, arr) =>
-            idx === 0 ||
-            Math.abs(pt.x - arr[idx - 1].x) > 1e-6 ||
-            Math.abs(pt.y - arr[idx - 1].y) > 1e-6 ||
-            pt.z !== arr[idx - 1].z,
-        )
-
-        this.solvedRoutes.push({
-          connectionName: unsolvedConnection.connectionName,
-          traceThickness: this.traceWidth,
-          viaDiameter: this.viaDiameter,
-          route,
-          vias: [viaPoint],
-        })
-        return
+        if (this.trySolveSamePointLayerChange(unsolvedConnection)) return
       }
     }
-    const { connectionName, points } = unsolvedConnection
     this.activeSubSolver =
-      new SingleHighDensityRouteSolver6_VertHorzLayer_FutureCost({
-        connectionName,
-        minDistBetweenEnteringPoints: this.minDistBetweenEnteringPoints,
-        bounds: getBoundsFromNodeWithPortPoints(this.nodeWithPortPoints),
-        A: { x: points[0].x, y: points[0].y, z: points[0].z },
-        B: {
-          x: points[points.length - 1].x,
-          y: points[points.length - 1].y,
-          z: points[points.length - 1].z,
-        },
-        obstacleRoutes: this.connMap
-          ? this.solvedRoutes.filter(
-              (sr) =>
-                !this.connMap!.areIdsConnected(
-                  sr.connectionName,
-                  connectionName,
-                ),
-            )
-          : this.solvedRoutes,
-        futureConnections: this.unsolvedConnections,
-        layerCount: this.nodeWithPortPoints.portPoints.reduce(
-          (max, p) => Math.max(max, (p.z ?? 0) + 1),
-          2,
-        ),
-        hyperParameters: this.hyperParameters,
-        connMap: this.connMap,
-        viaDiameter: this.viaDiameter,
-        traceThickness: this.traceWidth,
-      })
+      new SingleHighDensityRouteSolver6_VertHorzLayer_FutureCost(
+        this.getSingleRouteSolverOpts(unsolvedConnection),
+      )
   }
 
   visualize(): GraphicsObject {
@@ -338,4 +411,45 @@ export class IntraNodeRouteSolver extends BaseSolver {
 
     return graphics
   }
+}
+
+const isEndpointViaSafe = (
+  obstacleChecker: SingleHighDensityRouteSolver6_VertHorzLayer_FutureCost,
+  viaPoint: { x: number; y: number },
+  A: { x: number; y: number; z: number },
+  B: { x: number; y: number; z: number },
+) => {
+  const viaNode = {
+    x: viaPoint.x,
+    y: viaPoint.y,
+    z: A.z,
+    parent: {
+      x: A.x,
+      y: A.y,
+      z: A.z,
+      g: 0,
+      h: 0,
+      f: 0,
+      parent: null,
+    },
+    g: 0,
+    h: 0,
+    f: 0,
+  }
+
+  if (
+    obstacleChecker.isNodeTooCloseToObstacle(
+      viaNode,
+      obstacleChecker.viaDiameter / 2 + obstacleChecker.obstacleMargin / 2,
+      true,
+    )
+  ) {
+    return false
+  }
+
+  if (obstacleChecker.isNodeTooCloseToEdge(viaNode, true)) {
+    return false
+  }
+
+  return true
 }

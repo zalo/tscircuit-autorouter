@@ -156,7 +156,7 @@ test("HighDensitySolver emits node markers only after completion", () => {
 
   expect(rectMarkers.length).toBe(0)
   expect(pointMarkers.length).toBe(2)
-  expect(pointMarkers[0].color).toBe("red")
+  expect(pointMarkers[0].color).toBe("blue")
   expect(pointMarkers[0].label).toContain("solver:")
   expect(pointMarkers[0].label).toContain("node:")
   expect(pointMarkers[0].label).toContain("status: solved")
@@ -165,4 +165,7 @@ test("HighDensitySolver emits node markers only after completion", () => {
     finalViz.lines?.filter((line) => line.layer === "hd_node_boundaries") ?? []
   expect(dashedBoundaryLines.length).toBe(8)
   expect(dashedBoundaryLines[0].strokeDash).toBe("6, 4")
+  expect(dashedBoundaryLines.every((line) => line.strokeColor === "blue")).toBe(
+    true,
+  )
 })

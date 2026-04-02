@@ -110,8 +110,45 @@ export const HyperHighDensityDebugger = ({
     )
   }
 
+  const overallStatus = solver.solved
+    ? "solved"
+    : solver.failed
+      ? "failed"
+      : "running"
+  const focusedStatus = focusedSolver?.solved
+    ? "solved"
+    : focusedSolver?.failed
+      ? "failed"
+      : "running"
+
   return (
     <div className="p-1">
+      <div
+        className={`mb-2 rounded border p-2 text-sm ${
+          overallStatus === "solved"
+            ? "border-green-300 bg-green-50"
+            : overallStatus === "failed"
+              ? "border-red-300 bg-red-50"
+              : "border-amber-300 bg-amber-50"
+        }`}
+      >
+        <div>
+          Overall hyper solver status: <b>{overallStatus}</b>
+        </div>
+        {solver.winningSolver && (
+          <div>Winning solver: {solver.winningSolver.getSolverName()}</div>
+        )}
+        {solver.error && (
+          <div className="mt-1 whitespace-pre-wrap">Error: {solver.error}</div>
+        )}
+        {focusedSolver && (
+          <div className="mt-1">
+            Focused variant {tab}: <b>{focusedStatus}</b> (
+            {focusedSolver.getSolverName()})
+          </div>
+        )}
+      </div>
+
       <div>
         {solver.supervisedSolvers?.map((supervisedSolver, index) => (
           <button

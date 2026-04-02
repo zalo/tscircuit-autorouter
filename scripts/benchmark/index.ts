@@ -7,20 +7,13 @@ import * as path from "node:path"
 import * as readline from "node:readline"
 import type { SimpleRouteJson } from "../../lib/types/srj-types"
 import type {
+  BenchmarkReport,
   BenchmarkTask,
+  SolverRunSummary,
   WorkerResult,
   WorkerResultMessage,
   WorkerTaskMessage,
 } from "./benchmark-types"
-
-type SolverRunResult = {
-  solverName: string
-  completedRateLabel: string
-  relaxedDrcRateLabel: string
-  timedOutLabel: string
-  p50TimeMs: number | null
-  p95TimeMs: number | null
-}
 
 type BenchmarkOptions = {
   solverName?: string
@@ -54,10 +47,28 @@ type WorkerExecutionResult = {
 const DEFAULT_TASK_TIMEOUT_PER_EFFORT_MS = 60 * 1000
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30 * 1000
 const DEFAULT_TERMINATE_TIMEOUT_MS = 5 * 1000
-const DATASET_NAMES = ["dataset01", "zdwiel"] as const
+const DATASET_NAMES = ["dataset01", "zdwiel", "srj05"] as const
 
 type DatasetName = (typeof DATASET_NAMES)[number]
 type DatasetModule = Record<string, unknown>
+
+const toSimpleRouteJson = (value: unknown): SimpleRouteJson | null => {
+  if (!value || typeof value !== "object") {
+    return null
+  }
+
+  const asRecord = value as Record<string, unknown>
+  const candidate =
+    asRecord.simpleRouteJson && typeof asRecord.simpleRouteJson === "object"
+      ? asRecord.simpleRouteJson
+      : value
+
+  if (!candidate || typeof candidate !== "object") {
+    return null
+  }
+
+  return "bounds" in candidate ? (candidate as SimpleRouteJson) : null
+}
 
 const isDatasetName = (value: string): value is DatasetName =>
   DATASET_NAMES.includes(value as DatasetName)
@@ -66,11 +77,14 @@ const datasetLoaders: Record<DatasetName, () => Promise<DatasetModule>> = {
   dataset01: async () =>
     (await import("@tscircuit/autorouting-dataset-01")) as DatasetModule,
   zdwiel: async () => (await import("zdwiel-dataset")) as DatasetModule,
+  srj05: async () =>
+    (await import("@tscircuit/dataset-srj05")) as DatasetModule,
 }
 
 const datasetScenarioKeyPatterns: Record<DatasetName, RegExp> = {
   dataset01: /^circuit\d+$/,
   zdwiel: /^ts\d+_/,
+  srj05: /^sample\d{3}.*Circuit$/,
 }
 
 const formatTime = (timeMs: number | null) => {
@@ -274,25 +288,41 @@ const loadSolverNames = async (
   )
   const pipelinesIndex = await readFile(pipelinesIndexPath, "utf8")
 
-  const pipelineNames: string[] = []
-  for (const match of pipelinesIndex.matchAll(/export\s*\{\s*(\w+)\s*\}/g)) {
-    pipelineNames.push(match[1])
+  const pipelineNames = new Set<string>()
+  for (const match of pipelinesIndex.matchAll(
+    /export\s*\{([\s\S]*?)\}\s*from/g,
+  )) {
+    const exportEntries = match[1]
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+
+    for (const entry of exportEntries) {
+      const localName = entry.split(/\s+as\s+/)[0]?.trim()
+      if (localName) {
+        pipelineNames.add(localName)
+      }
+    }
   }
 
   // Resolve aliases from lib/index.ts (e.g. "X as Y")
   const libIndexPath = path.join(process.cwd(), "lib", "index.ts")
   const libIndex = await readFile(libIndexPath, "utf8")
 
-  const solverNames = pipelineNames.map((name) => {
-    const aliasMatch = libIndex.match(new RegExp(`${name}\\s+as\\s+(\\w+)`))
-    return aliasMatch ? aliasMatch[1] : name
+  const solverNames = [...pipelineNames].flatMap((name) => {
+    const aliasMatches = [
+      ...libIndex.matchAll(new RegExp(`${name}\\s+as\\s+(\\w+)`, "g")),
+    ].map((match) => match[1])
+
+    return [name, ...aliasMatches]
   })
+  const uniqueSolverNames = [...new Set(solverNames)]
 
   if (!excludeAssignable) {
-    return solverNames
+    return uniqueSolverNames
   }
 
-  return solverNames.filter((name) => !name.includes("Assignable"))
+  return uniqueSolverNames.filter((name) => !name.includes("Assignable"))
 }
 
 const loadScenarios = async (
@@ -311,10 +341,9 @@ const loadScenarios = async (
 
   const datasetModule = await datasetLoaders[datasetName]()
   const scenarioKeyPattern = datasetScenarioKeyPatterns[datasetName]
-  const allScenarios = (
-    Object.entries(datasetModule) as Array<[string, SimpleRouteJson]>
-  )
-    .filter(([, value]) => Boolean(value) && typeof value === "object")
+  const allScenarios = Object.entries(datasetModule)
+    .map(([name, value]) => [name, toSimpleRouteJson(value)] as const)
+    .filter((entry): entry is [string, SimpleRouteJson] => Boolean(entry[1]))
     .filter(([name]) => scenarioKeyPattern.test(name))
     .sort(([a], [b]) => a.localeCompare(b))
     .map(
@@ -330,7 +359,7 @@ const loadScenarios = async (
   return scenarioLimit ? allScenarios.slice(0, scenarioLimit) : allScenarios
 }
 
-const formatTable = (rows: SolverRunResult[]) => {
+const formatTable = (rows: SolverRunSummary[]) => {
   const headers = [
     "Solver",
     "Completed %",
@@ -763,9 +792,8 @@ const runBenchmarkTasks = async (
 
 const summarizeSolverResults = (
   solverName: string,
-  efforts: number[],
   results: WorkerResult[],
-): SolverRunResult => {
+): SolverRunSummary => {
   const timedOut = results.filter((result) => result.didTimeout)
   const succeeded = results.filter((result) => result.didSolve)
   const elapsedForSucceeded = succeeded.map((result) => result.elapsedTimeMs)
@@ -788,7 +816,7 @@ const summarizeSolverResults = (
     timedOutLabel: `${timedOut.length}/${results.length}`,
     p50TimeMs: getPercentileMs(elapsedForSucceeded, 0.5),
     p95TimeMs: getPercentileMs(elapsedForSucceeded, 0.95),
-  } satisfies SolverRunResult
+  } satisfies SolverRunSummary
 }
 
 const main = async () => {
@@ -834,13 +862,6 @@ const main = async () => {
   const rows = solvers.map((solver) =>
     summarizeSolverResults(
       solver,
-      scenarios.map(([, scenario]) =>
-        getTaskEffort({
-          solverName: solver,
-          scenarioName: "",
-          scenario,
-        }),
-      ),
       results.filter((result) => result.solverName === solver),
     ),
   )
@@ -856,13 +877,24 @@ const main = async () => {
   )
   const table = formatTable(rows)
   const output = `Benchmark Results (${effortLabel})\n\n${table}\n\nDataset: ${datasetName}\nScenarios: ${scenarios.length}\n`
+  const report: BenchmarkReport = {
+    version: 1,
+    datasetName,
+    scenarioCount: scenarios.length,
+    effortLabel,
+    summary: rows,
+    tests: results,
+  }
   await Bun.write("benchmark-result.txt", output)
+  await Bun.write("benchmark-result.json", JSON.stringify(report, null, 2))
 
   console.log(`\nBenchmark Results (${effortLabel})\n`)
   console.log(table)
   console.log(`\nDataset: ${datasetName}`)
   console.log(`\nScenarios: ${scenarios.length}`)
-  console.log("Results written to benchmark-result.txt")
+  console.log(
+    "Results written to benchmark-result.txt and benchmark-result.json",
+  )
 }
 
 main().catch((error) => {

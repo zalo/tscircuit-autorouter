@@ -19,6 +19,7 @@ import {
   HighDensitySolverA03 as HighDensityA03Solver,
 } from "@tscircuit/high-density-a01"
 import { FixedTopologyHighDensityIntraNodeSolver } from "../FixedTopologyHighDensityIntraNodeSolver"
+import { SingleLayerNoDifferentRootIntersectionsIntraNodeSolver } from "../HighDensitySolver/SingleLayerNoDifferentRootIntersectionsIntraNodeSolver"
 
 export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
   | IntraNodeRouteSolver
@@ -26,6 +27,7 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
   | SingleTransitionCrossingRouteSolver
   | SingleTransitionIntraNodeSolver
   | FixedTopologyHighDensityIntraNodeSolver
+  | SingleLayerNoDifferentRootIntersectionsIntraNodeSolver
   | HighDensityA03Solver
 > {
   override getSolverName(): string {
@@ -55,6 +57,7 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
 
   getCombinationDefs() {
     return [
+      ["singleLayerNoDifferentRootIntersections"],
       ["multiHeadPolyLine"],
       ["majorCombinations", "orderings6", "cellSizeFactor"],
       ["noVias"],
@@ -70,6 +73,14 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
 
   getHyperParameterDefs() {
     return [
+      {
+        name: "singleLayerNoDifferentRootIntersections",
+        possibleValues: [
+          {
+            SINGLE_LAYER_NO_DIFFERENT_ROOT_INTERSECTIONS: true,
+          },
+        ],
+      },
       {
         name: "majorCombinations",
         possibleValues: [
@@ -239,19 +250,45 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
   }
 
   generateSolver(hyperParameters: any): IntraNodeRouteSolver {
+    if (hyperParameters.SINGLE_LAYER_NO_DIFFERENT_ROOT_INTERSECTIONS) {
+      if (
+        !SingleLayerNoDifferentRootIntersectionsIntraNodeSolver.isApplicable(
+          this.nodeWithPortPoints,
+        )
+      ) {
+        const ineligibleSolver = new IntraNodeRouteSolver({
+          nodeWithPortPoints: this.nodeWithPortPoints,
+          connMap: this.connMap,
+          traceWidth: this.constructorParams.traceWidth,
+          viaDiameter: this.constructorParams.viaDiameter,
+          obstacleMargin: this.constructorParams.obstacleMargin,
+        })
+        ineligibleSolver.failed = true
+        ineligibleSolver.error =
+          "Single-layer no-different-root-intersection solver not applicable"
+        return ineligibleSolver as any
+      }
+
+      return new SingleLayerNoDifferentRootIntersectionsIntraNodeSolver({
+        nodeWithPortPoints: this.nodeWithPortPoints,
+        traceWidth: this.constructorParams.traceWidth,
+        viaDiameter: this.constructorParams.viaDiameter,
+      }) as any
+    }
+
     if (hyperParameters.HIGH_DENSITY_A01) {
       const solver = new HighDensitySolverA01({
         nodeWithPortPoints: this.nodeWithPortPoints,
         cellSizeMm: 0.1,
         viaDiameter: this.constructorParams.viaDiameter ?? 0.3,
         viaMinDistFromBorder: 0.15,
-        traceMargin: 0.15,
+        traceMargin: 0.1,
         traceThickness: this.constructorParams.traceWidth ?? 0.15,
+        effort: this.effort,
         hyperParameters: {
           shuffleSeed: hyperParameters.SHUFFLE_SEED ?? 0,
         },
       })
-      solver.MAX_ITERATIONS = 10_000_000
       return solver as any
     }
     if (hyperParameters.HIGH_DENSITY_A03) {
@@ -262,15 +299,15 @@ export class HyperSingleIntraNodeSolver extends HyperParameterSupervisorSolver<
         lowResolutionCellSize: 0.4,
         viaDiameter: this.constructorParams.viaDiameter ?? 0.3,
         viaMinDistFromBorder: 0.15,
-        traceMargin: 0.15,
+        traceMargin: 0.1,
         // This likely needs to be corrected to use the actual trace width-
         // but using anything but 0.1 for traceThickness is causing issues
         // needs more debugging- repro01 in the high-density-a01 repo
         // has a good reproduction
         traceThickness: 0.1, // this.constructorParams.traceWidth ?? 0.15,
+        effort: this.effort,
         hyperParameters,
       })
-      solver.MAX_ITERATIONS *= this.effort
       return solver as any
     }
     if (hyperParameters.CLOSED_FORM_TWO_TRACE_SAME_LAYER) {

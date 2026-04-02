@@ -24,6 +24,8 @@ const cloneValue = <T>(value: T): T =>
 
 setupGlobalCaches()
 
+const INTRA_NODE_CACHE_SCHEMA_VERSION = 2
+
 export class CachedIntraNodeRouteSolver
   extends IntraNodeRouteSolver
   implements
@@ -122,6 +124,7 @@ export class CachedIntraNodeRouteSolver
       : undefined
 
     const keyData = {
+      cacheSchemaVersion: INTRA_NODE_CACHE_SCHEMA_VERSION,
       node: {
         width: roundCoord(this.nodeWithPortPoints.width),
         height: roundCoord(this.nodeWithPortPoints.height),
@@ -138,6 +141,9 @@ export class CachedIntraNodeRouteSolver
       minDistBetweenEnteringPoints: roundCoord(
         this.minDistBetweenEnteringPoints,
       ),
+      traceWidth: roundCoord(this.traceWidth),
+      viaDiameter: roundCoord(this.viaDiameter),
+      obstacleMargin: roundCoord(this.obstacleMargin),
       normalizedConnMap,
     }
 

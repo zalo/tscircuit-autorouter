@@ -36,6 +36,7 @@ export class SingleHighDensityRouteSolver extends BaseSolver {
   traceThickness: number
   obstacleMargin: number
   layerCount: number
+  availableZ: number[]
   minCellSize = 0.05
   cellStep = 0.05
   GREEDY_MULTIPLER = 1.1
@@ -81,6 +82,7 @@ export class SingleHighDensityRouteSolver extends BaseSolver {
     traceThickness?: number
     obstacleMargin?: number
     layerCount?: number
+    availableZ?: number[]
     futureConnections?: FutureConnection[]
     hyperParameters?: Partial<HighDensityHyperParameters>
     connMap?: ConnectivityMap
@@ -104,8 +106,12 @@ export class SingleHighDensityRouteSolver extends BaseSolver {
     this.B = opts.B
     this.viaDiameter = opts.viaDiameter ?? 0.3
     this.traceThickness = opts.traceThickness ?? 0.15
-    this.obstacleMargin = opts.obstacleMargin ?? 0.2
+    this.obstacleMargin = opts.obstacleMargin ?? 0.15
     this.layerCount = opts.layerCount ?? 2
+    this.availableZ =
+      opts.availableZ && opts.availableZ.length > 0
+        ? [...new Set(opts.availableZ)].sort((a, b) => a - b)
+        : Array.from({ length: this.layerCount }, (_, index) => index)
     this.exploredNodes = new Set()
     this.straightLineDistance = distance(this.A, this.B)
     this.futureConnections = opts.futureConnections ?? []
@@ -442,7 +448,7 @@ export class SingleHighDensityRouteSolver extends BaseSolver {
     }
 
     // Add via neighbors for all other layers (a via can connect any layer to any other layer)
-    for (let newZ = 0; newZ < this.layerCount; newZ++) {
+    for (const newZ of this.availableZ) {
       if (newZ === node.z) continue
 
       const viaNeighbor = {

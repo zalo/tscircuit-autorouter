@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
 import { SingleHighDensityRouteSolver } from "lib/solvers/HighDensitySolver/SingleHighDensityRouteSolver"
+import { SingleHighDensityRouteSolver6_VertHorzLayer_FutureCost } from "lib/solvers/HighDensitySolver/SingleHighDensityRouteSolver6_VertHorzLayer_FutureCost"
 import type { HighDensityIntraNodeRoute } from "lib/types/high-density-types"
 
 const baseOpts = {
@@ -80,4 +81,27 @@ test("SingleHighDensityRouteSolver ignores connected obstacle segments for clear
   expect(
     solver.doesPathToParentIntersectObstacle(intersectingNode as any),
   ).toBe(false)
+})
+
+test("SingleHighDensityRouteSolver respects availableZ when generating via neighbors", () => {
+  const solver = new SingleHighDensityRouteSolver6_VertHorzLayer_FutureCost({
+    ...baseOpts,
+    A: { x: 5, y: 5, z: 1 },
+    B: { x: 7, y: 7, z: 1 },
+    obstacleRoutes: [],
+    availableZ: [1],
+    layerCount: 2,
+  })
+
+  const neighbors = solver.getNeighbors({
+    x: 5,
+    y: 5,
+    z: 1,
+    g: 0,
+    h: 0,
+    f: 0,
+    parent: { x: 5, y: 5, z: 1, g: 0, h: 0, f: 0, parent: null },
+  } as any)
+
+  expect(neighbors.every((neighbor) => neighbor.z === 1)).toBe(true)
 })

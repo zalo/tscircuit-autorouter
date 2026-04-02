@@ -28,6 +28,7 @@ export class HighDensitySolver extends BaseSolver {
   readonly defaultTraceThickness = 0.15
   viaDiameter: number
   traceWidth: number
+  obstacleMargin: number
   effort: number
 
   failedSolvers: (IntraNodeRouteSolver | HyperSingleIntraNodeSolver)[]
@@ -54,6 +55,7 @@ export class HighDensitySolver extends BaseSolver {
     connMap,
     viaDiameter,
     traceWidth,
+    obstacleMargin,
     effort,
     nodePfById,
   }: {
@@ -62,6 +64,7 @@ export class HighDensitySolver extends BaseSolver {
     connMap?: ConnectivityMap
     viaDiameter?: number
     traceWidth?: number
+    obstacleMargin?: number
     effort?: number
     nodePfById?:
       | Map<CapacityMeshNodeId, number | null>
@@ -77,6 +80,7 @@ export class HighDensitySolver extends BaseSolver {
     this.MAX_ITERATIONS = 10e6 * this.effort
     this.viaDiameter = viaDiameter ?? this.defaultViaDiameter
     this.traceWidth = traceWidth ?? this.defaultTraceThickness
+    this.obstacleMargin = obstacleMargin ?? 0.15
     this.nodePfById =
       nodePfById instanceof Map
         ? new Map(nodePfById)
@@ -161,6 +165,9 @@ export class HighDensitySolver extends BaseSolver {
   ): string {
     if (hyperParameters?.MULTI_HEAD_POLYLINE_SOLVER) {
       return "MultiHeadPolyLineIntraNodeSolver3"
+    }
+    if (hyperParameters?.SINGLE_LAYER_NO_DIFFERENT_ROOT_INTERSECTIONS) {
+      return "SingleLayerNoDifferentRootIntersectionsIntraNodeSolver"
     }
     if (hyperParameters?.CLOSED_FORM_SINGLE_TRANSITION) {
       return "SingleTransitionIntraNodeSolver"
@@ -251,6 +258,7 @@ export class HighDensitySolver extends BaseSolver {
       connMap: this.connMap,
       viaDiameter: this.viaDiameter,
       traceWidth: this.traceWidth,
+      obstacleMargin: this.obstacleMargin,
       effort: this.effort,
     })
     this.updateCacheStats()
@@ -285,10 +293,10 @@ export class HighDensitySolver extends BaseSolver {
           strokeColor:
             segment.z === 0
               ? segment.color
-              : safeTransparentize(segment.color, 0.75),
+              : safeTransparentize(segment.color, 0.5),
           layer: `z${segment.z}`,
           strokeWidth: route.traceThickness,
-          strokeDash: segment.z !== 0 ? "10, 5" : undefined,
+          strokeDash: segment.z !== 0 ? [0.1, 0.3] : undefined,
         })
       }
       for (const via of route.vias) {
@@ -309,6 +317,7 @@ export class HighDensitySolver extends BaseSolver {
         const bottom = metadata.node.center.y + metadata.node.height / 2
 
         const label = this.createNodeMarkerLabel(capacityMeshNodeId, metadata)
+        const markerColor = metadata.status === "solved" ? "blue" : "red"
 
         graphics.lines!.push(
           {
@@ -317,7 +326,7 @@ export class HighDensitySolver extends BaseSolver {
               { x: right, y: top },
             ],
             layer: "hd_node_boundaries",
-            strokeColor: "red",
+            strokeColor: markerColor,
             strokeDash: "6, 4",
             strokeWidth: 0.03,
             label,
@@ -328,7 +337,7 @@ export class HighDensitySolver extends BaseSolver {
               { x: right, y: bottom },
             ],
             layer: "hd_node_boundaries",
-            strokeColor: "red",
+            strokeColor: markerColor,
             strokeDash: "6, 4",
             strokeWidth: 0.03,
             label,
@@ -339,7 +348,7 @@ export class HighDensitySolver extends BaseSolver {
               { x: left, y: bottom },
             ],
             layer: "hd_node_boundaries",
-            strokeColor: "red",
+            strokeColor: markerColor,
             strokeDash: "6, 4",
             strokeWidth: 0.03,
             label,
@@ -350,7 +359,7 @@ export class HighDensitySolver extends BaseSolver {
               { x: left, y: top },
             ],
             layer: "hd_node_boundaries",
-            strokeColor: "red",
+            strokeColor: markerColor,
             strokeDash: "6, 4",
             strokeWidth: 0.03,
             label,
@@ -361,11 +370,25 @@ export class HighDensitySolver extends BaseSolver {
           graphics.points!.push({
             x: metadata.node.center.x,
             y: metadata.node.center.y,
-            color: "red",
+            color: markerColor,
             layer: "hd_node_markers",
             label,
           })
         } else {
+          graphics.lines!.push({
+            points: [
+              { x: 0, y: 0 },
+              {
+                x: metadata.node.center.x,
+                y: metadata.node.center.y,
+              },
+            ],
+            layer: "hd_failed_node_guides",
+            strokeColor: "red",
+            strokeDash: "8, 6",
+            strokeWidth: 0.05,
+            label,
+          })
           const rectWidth = Math.max(metadata.node.width * 0.1, 0.12)
           const rectHeight = Math.max(metadata.node.height * 0.1, 0.12)
           graphics.rects!.push({

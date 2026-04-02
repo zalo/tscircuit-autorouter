@@ -5,10 +5,10 @@ import {
   type ViaData,
   type ViaByNet,
   type ViaTile,
-  ViaGraphSolver,
-  createConvexViaGraphFromXYConnections,
-} from "@tscircuit/hypergraph"
+  FixedViaHypergraphSolver,
+} from "@tscircuit/fixed-via-hypergraph-solver/lib/index"
 import { ConnectivityMap } from "circuit-json-to-connectivity-map"
+import type { GraphicsObject } from "graphics-debug"
 import type {
   HighDensityIntraNodeRoute,
   NodeWithPortPoints,
@@ -54,11 +54,10 @@ export class FixedTopologyHighDensityIntraNodeSolver extends BaseSolver {
   connMap?: ConnectivityMap
 
   rootConnectionNameByConnectionId: Map<string, string | undefined> = new Map()
-  lastActiveSubSolver: ViaGraphSolver | null = null
+  lastActiveSubSolver: FixedViaHypergraphSolver | null = null
 
   solvedRoutes: HighDensityIntraNodeRouteWithVias[] = []
   vias: ViaRegion[] = []
-  tiledViasByNet: ViaByNet = {}
 
   constructor(params: FixedTopologyHighDensityIntraNodeSolverParams) {
     super()
@@ -73,6 +72,16 @@ export class FixedTopologyHighDensityIntraNodeSolver extends BaseSolver {
     if (Object.keys(this.colorMap).length === 0) {
       this.colorMap = buildColorMapFromPortPoints(this.nodeWithPortPoints)
     }
+
+    const nonTopLayerPortPoint = this.nodeWithPortPoints.portPoints.find(
+      (pp) => pp.z !== 0,
+    )
+    if (nonTopLayerPortPoint) {
+      this.error =
+        "FixedTopologyHighDensityIntraNodeSolver only supports top-layer (z=0) port points; found bottom-layer input."
+      this.failed = true
+      this.solved = false
+    }
   }
 
   getConstructorParams(): FixedTopologyHighDensityIntraNodeSolverParams {
@@ -86,7 +95,7 @@ export class FixedTopologyHighDensityIntraNodeSolver extends BaseSolver {
     return 0.3
   }
 
-  private _initializeGraph(): ViaGraphSolver | null {
+  private _initializeGraph(): FixedViaHypergraphSolver | null {
     // Build connections from port points
     const connectionMap = new Map<
       string,
@@ -123,21 +132,12 @@ export class FixedTopologyHighDensityIntraNodeSolver extends BaseSolver {
     }
     if (inputConnections.length === 0) return null
 
-    const convexGraph = createConvexViaGraphFromXYConnections(inputConnections)
-    this.tiledViasByNet = convexGraph.viaTile.viasByNet ?? {}
-
-    return new ViaGraphSolver({
-      inputGraph: {
-        regions: convexGraph.regions,
-        ports: convexGraph.ports,
-      },
-      inputConnections: convexGraph.connections,
-      viaTile: convexGraph.viaTile,
-    })
+    return new FixedViaHypergraphSolver({ inputConnections })
   }
 
   _step() {
-    let activeSubSolver = this.activeSubSolver as ViaGraphSolver | null
+    let activeSubSolver = this
+      .activeSubSolver as FixedViaHypergraphSolver | null
     if (!activeSubSolver) {
       activeSubSolver = this._initializeGraph()
       if (!activeSubSolver) {
@@ -395,7 +395,7 @@ export class FixedTopologyHighDensityIntraNodeSolver extends BaseSolver {
     )
   }
 
-  private _processResults(viaGraphSolver: ViaGraphSolver) {
+  private _processResults(viaGraphSolver: FixedViaHypergraphSolver) {
     this.solvedRoutes = []
     const viaTile = viaGraphSolver.viaTile
     const fallbackViaDiameter = viaTile
@@ -578,7 +578,7 @@ export class FixedTopologyHighDensityIntraNodeSolver extends BaseSolver {
     return this.vias
   }
 
-  override visualize() {
+  override visualize(): GraphicsObject {
     if (this.activeSubSolver) {
       return this.activeSubSolver.visualize()
     }

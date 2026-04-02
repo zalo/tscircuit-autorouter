@@ -1,6 +1,11 @@
 import type { GraphicsObject } from "graphics-debug"
 import { CachableSolver, CacheProvider } from "lib/cache/types"
 
+export type PendingEffect = {
+  name: string
+  promise: Promise<unknown>
+}
+
 export class BaseSolver {
   MAX_ITERATIONS = 1000
   solved = false
@@ -12,6 +17,7 @@ export class BaseSolver {
   failedSubSolvers?: BaseSolver[]
   timeToSolve?: number
   stats: Record<string, any> = {}
+  pendingEffects?: PendingEffect[]
 
   /**
    * For cached solvers

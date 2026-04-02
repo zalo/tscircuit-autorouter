@@ -1,3 +1,5 @@
+import { PipelineStagesTable } from "@tscircuit/solver-utils/react"
+import { convertCircuitJsonToPcbSvg } from "circuit-to-svg"
 import { GraphicsObject, Line, Point, Rect } from "graphics-debug"
 import {
   InteractiveGraphics,
@@ -7,24 +9,26 @@ import { AssignableAutoroutingPipeline1Solver } from "lib/autorouter-pipelines/A
 import { AssignableAutoroutingPipeline2 } from "lib/autorouter-pipelines/AssignableAutoroutingPipeline2/AssignableAutoroutingPipeline2"
 import { AssignableAutoroutingPipeline3 } from "lib/autorouter-pipelines/AssignableAutoroutingPipeline3/AssignableAutoroutingPipeline3"
 import { AutoroutingPipeline1_OriginalUnravel } from "lib/autorouter-pipelines/AutoroutingPipeline1_OriginalUnravel/AutoroutingPipeline1_OriginalUnravel"
+import { AutoroutingPipelineSolver3_HgPortPointPathing } from "lib/autorouter-pipelines/AutoroutingPipeline3_HgPortPointPathing/AutoroutingPipelineSolver3_HgPortPointPathing"
+import { AutoroutingPipelineSolver4 } from "lib/autorouter-pipelines/AutoroutingPipeline4_TinyHypergraph/AutoroutingPipelineSolver4_TinyHypergraph"
+import { AutoroutingPipelineSolver5 } from "lib/autorouter-pipelines/AutoroutingPipeline5_HdCache/AutoroutingPipelineSolver5_HdCache"
 import {
   AutoroutingPipelineSolver2_PortPointPathing,
   CapacityMeshSolver,
 } from "lib/autorouter-pipelines/AutoroutingPipeline2_PortPointPathing/AutoroutingPipelineSolver2_PortPointPathing"
-import { AutoroutingPipelineSolver3_HgPortPointPathing } from "lib/autorouter-pipelines/AutoroutingPipeline2_PortPointPathing/AutoroutingPipelineSolver3_HgPortPointPathing"
 import {
   getGlobalInMemoryCache,
   getGlobalLocalStorageCache,
 } from "lib/cache/setupGlobalCaches"
 import { CacheProvider } from "lib/cache/types"
 import { BaseSolver } from "lib/solvers/BaseSolver"
+import { getPendingEffectsFromSolverTree } from "lib/solvers/getPendingEffectsFromSolverTree"
 import { getNodesNearNode } from "lib/solvers/UnravelSolver/getNodesNearNode"
 import { SimpleRouteJson } from "lib/types"
 import { addVisualizationToLastStep } from "lib/utils/addVisualizationToLastStep"
 import { combineVisualizations } from "lib/utils/combineVisualizations"
 import { limitVisualizations } from "lib/utils/limitVisualizations"
 import { useEffect, useMemo, useRef, useState } from "react"
-import { PipelineStagesTable } from "@tscircuit/solver-utils/react"
 import {
   AutoroutingPipelineMenuBar,
   EFFORT_LEVELS,
@@ -36,15 +40,19 @@ import {
 } from "./AutoroutingPipelineMenuBar"
 import { GreedySequentialPipelineSolver } from "lib/autorouter-pipelines/GreedySequentialPipeline/GreedySequentialPipelineSolver"
 import { CacheDebugger } from "./CacheDebugger"
-import { RELAXED_DRC_OPTIONS } from "./drcPresets"
 import { SolveBreakpointDialog } from "./SolveBreakpointDialog"
+import { RELAXED_DRC_OPTIONS } from "./drcPresets"
 import { getDrcErrors } from "./getDrcErrors"
+import { getCurrentCircuitJson } from "./autorouting-pipeline-debugger/getCurrentCircuitJson"
 import { convertToCircuitJson } from "./utils/convertToCircuitJson"
 import { filterUnravelMultiSectionInput } from "./utils/filterUnravelMultiSectionInput"
+import { getHighDensityNodeDownloadData } from "./utils/getHighDensityNodeDownloadData"
 
 const PIPELINE_SOLVERS = {
   AutoroutingPipelineSolver2_PortPointPathing,
   AutoroutingPipelineSolver3_HgPortPointPathing,
+  AutoroutingPipelineSolver4,
+  AutoroutingPipelineSolver5,
   AssignableAutoroutingPipeline1Solver,
   AssignableAutoroutingPipeline2,
   AssignableAutoroutingPipeline3,
@@ -55,6 +63,8 @@ const PIPELINE_SOLVERS = {
 const PIPELINE_STORAGE_KEY = "selectedPipeline"
 const EFFORT_STORAGE_KEY = "selectedEffort"
 const LAYER_OVERRIDE_STORAGE_KEY = "selectedLayerOverride"
+const AUTO_SOLVE_STORAGE_KEY = "autoSolve"
+const AUTO_RUN_DRC_STORAGE_KEY = "autoRunDrc"
 
 const parseLayerOverride = (value: string | null): LayerOverride => {
   if (value === "auto") return "auto"
@@ -180,6 +190,55 @@ type PipelineDebuggerSolver = BaseSolver & {
   [key: string]: any
 }
 
+type AsyncPipelineDebuggerSolver = PipelineDebuggerSolver & {
+  stepAsync?: () => Promise<void>
+  solveAsync?: () => Promise<void>
+}
+
+const waitForNextPaint = () =>
+  new Promise<void>((resolve) => {
+    if (
+      typeof window !== "undefined" &&
+      typeof window.requestAnimationFrame === "function"
+    ) {
+      window.requestAnimationFrame(() => resolve())
+      return
+    }
+
+    setTimeout(resolve, 0)
+  })
+
+const solverSupportsAsyncStep = (
+  solver: AsyncPipelineDebuggerSolver,
+): solver is AsyncPipelineDebuggerSolver & {
+  stepAsync: () => Promise<void>
+} => typeof solver.stepAsync === "function"
+
+const solverSupportsAsyncSolve = (
+  solver: AsyncPipelineDebuggerSolver,
+): solver is AsyncPipelineDebuggerSolver & {
+  solveAsync: () => Promise<void>
+} => typeof solver.solveAsync === "function"
+
+const waitForNextPendingEffect = async (
+  solver: AsyncPipelineDebuggerSolver,
+) => {
+  const pendingEffects = getPendingEffectsFromSolverTree(solver)
+  if (pendingEffects.length === 0) {
+    return false
+  }
+
+  await Promise.race(
+    pendingEffects.map((effect) =>
+      effect.promise.then(
+        () => effect.name,
+        () => effect.name,
+      ),
+    ),
+  )
+  return true
+}
+
 const createGenericPipelineTableAdapter = (solver: PipelineDebuggerSolver) => {
   const pipelineDef = solver.pipelineDef ?? []
   const firstIterationOfStage: Record<string, number> = {}
@@ -298,6 +357,32 @@ export const AutoroutingPipelineDebugger = ({
     }
   }
 
+  const [autoSolve, setAutoSolveState] = useState<boolean>(
+    () => localStorage.getItem(AUTO_SOLVE_STORAGE_KEY) === "true",
+  )
+
+  const setAutoSolve = (enabled: boolean) => {
+    setAutoSolveState(enabled)
+    try {
+      localStorage.setItem(AUTO_SOLVE_STORAGE_KEY, String(enabled))
+    } catch (e) {
+      console.warn("Could not save auto-solve preference to localStorage:", e)
+    }
+  }
+
+  const [autoRunDrc, setAutoRunDrcState] = useState<boolean>(
+    () => localStorage.getItem(AUTO_RUN_DRC_STORAGE_KEY) === "true",
+  )
+
+  const setAutoRunDrc = (enabled: boolean) => {
+    setAutoRunDrcState(enabled)
+    try {
+      localStorage.setItem(AUTO_RUN_DRC_STORAGE_KEY, String(enabled))
+    } catch (e) {
+      console.warn("Could not save auto-run DRC preference to localStorage:", e)
+    }
+  }
+
   const createNewSolver = (
     opts: {
       cacheProvider?: CacheProvider | null
@@ -397,24 +482,85 @@ export const AutoroutingPipelineDebugger = ({
     useState(false)
   const [showGenericPipelineSteps, setShowGenericPipelineSteps] =
     useState(false)
+  const [pcbSvgMarkup, setPcbSvgMarkup] = useState<string | null>(null)
   const [isBreakpointDialogOpen, setIsBreakpointDialogOpen] = useState(false)
   const [breakpointNodeId, setBreakpointNodeId] = useState<string>(
     () => window.localStorage.getItem("lastBreakpointNodeId") || "",
   )
   const isSolvingToBreakpointRef = useRef(false) // Ref to track breakpoint solving state
+  const autoSolvedSolverRef = useRef<any>(null)
+  const autoRanDrcForSolveRef = useRef(false)
+
+  const stepSolver = async (solverToStep: AsyncPipelineDebuggerSolver) => {
+    if (solverSupportsAsyncStep(solverToStep)) {
+      await solverToStep.stepAsync()
+      return
+    }
+
+    solverToStep.step()
+  }
+
+  const solveSolver = async (
+    solverToSolve: AsyncPipelineDebuggerSolver,
+    opts: {
+      onProgress?: () => Promise<void> | void
+    } = {},
+  ) => {
+    if (solverSupportsAsyncStep(solverToSolve) && opts.onProgress) {
+      while (!solverToSolve.solved && !solverToSolve.failed) {
+        let steppedSynchronously = false
+
+        while (
+          !solverToSolve.solved &&
+          !solverToSolve.failed &&
+          getPendingEffectsFromSolverTree(solverToSolve).length === 0
+        ) {
+          solverToSolve.step()
+          steppedSynchronously = true
+        }
+
+        if (steppedSynchronously) {
+          await opts.onProgress()
+        }
+
+        if (solverToSolve.solved || solverToSolve.failed) {
+          break
+        }
+
+        const waitedForAsync = await waitForNextPendingEffect(solverToSolve)
+        if (!waitedForAsync) {
+          continue
+        }
+
+        await opts.onProgress()
+      }
+      return
+    }
+
+    if (solverSupportsAsyncSolve(solverToSolve)) {
+      await solverToSolve.solveAsync()
+      return
+    }
+
+    solverToSolve.solve()
+  }
 
   // Reset solver
   const resetSolver = () => {
     setSolver(createNewSolver())
+    setPcbSvgMarkup(null)
     setDrcErrors(null) // Clear DRC errors when resetting
     setDrcErrorCount(0)
     setLastDrcMode(null)
+    autoRanDrcForSolveRef.current = false
     isSolvingToBreakpointRef.current = false // Stop breakpoint solving on reset
   }
 
   // Animation effect
   useEffect(() => {
     let intervalId: ReturnType<typeof setInterval> | undefined
+    let isTickRunning = false
+    let cancelled = false
 
     if (isSolvingToBreakpointRef.current) {
       setIsAnimating(false)
@@ -428,36 +574,104 @@ export const AutoroutingPipelineDebugger = ({
       const delay = speedLevel < 4 ? speedDef.delay : animationSpeed
 
       intervalId = setInterval(() => {
-        const stepsPerInterval = speedDef.steps
-
-        for (let i = 0; i < stepsPerInterval; i++) {
-          if (solver.solved || solver.failed) {
-            break
-          }
-          solver.step()
+        if (isTickRunning) {
+          return
         }
-        setForceUpdate((prev) => prev + 1)
+
+        isTickRunning = true
+
+        const stepsPerInterval = speedDef.steps
+        void (async () => {
+          try {
+            for (let i = 0; i < stepsPerInterval; i++) {
+              if (solver.solved || solver.failed) {
+                break
+              }
+              await stepSolver(solver as AsyncPipelineDebuggerSolver)
+            }
+
+            if (!cancelled) {
+              setForceUpdate((prev) => prev + 1)
+            }
+          } finally {
+            isTickRunning = false
+          }
+        })()
       }, delay)
     }
 
     return () => {
+      cancelled = true
       if (intervalId !== undefined) {
         clearInterval(intervalId)
       }
     }
-  }, [isAnimating, speedLevel, solver, animationSpeed])
+  }, [animationSpeed, isAnimating, solver, speedLevel])
+
+  useEffect(() => {
+    if (!autoSolve || solver.solved || solver.failed) {
+      return
+    }
+
+    if (autoSolvedSolverRef.current === solver) {
+      return
+    }
+
+    autoSolvedSolverRef.current = solver
+    isSolvingToBreakpointRef.current = false
+    setIsAnimating(false)
+
+    let cancelled = false
+
+    void (async () => {
+      const startTime = performance.now() / 1000
+      await solveSolver(solver as AsyncPipelineDebuggerSolver, {
+        onProgress: async () => {
+          if (cancelled) {
+            return
+          }
+          setForceUpdate((prev) => prev + 1)
+          await waitForNextPaint()
+        },
+      })
+      const endTime = performance.now() / 1000
+
+      if (!cancelled) {
+        setSolveTime(endTime - startTime)
+        setForceUpdate((prev) => prev + 1)
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [autoSolve, solver])
+
+  useEffect(() => {
+    if (!solver.solved) {
+      autoRanDrcForSolveRef.current = false
+      return
+    }
+
+    if (!autoRunDrc || autoRanDrcForSolveRef.current) {
+      return
+    }
+
+    autoRanDrcForSolveRef.current = true
+    runDrcChecks("strict")
+  }, [autoRunDrc, solver, solver.solved])
 
   // Manual step function
-  const handleStep = () => {
+  const handleStep = async () => {
     if (!solver.solved && !solver.failed) {
-      solver.step()
+      await stepSolver(solver as AsyncPipelineDebuggerSolver)
       setForceUpdate((prev) => prev + 1)
     }
     isSolvingToBreakpointRef.current = false // Stop breakpoint solving on manual step
   }
 
   // Next Stage function
-  const handleNextStage = () => {
+  const handleNextStage = async () => {
     if (!solver.solved && !solver.failed) {
       const initialSubSolver = solver.activeSubSolver
 
@@ -468,7 +682,7 @@ export const AutoroutingPipelineDebugger = ({
           !solver.failed &&
           solver.activeSubSolver === null
         ) {
-          solver.step()
+          await stepSolver(solver as AsyncPipelineDebuggerSolver)
         }
       }
 
@@ -479,7 +693,7 @@ export const AutoroutingPipelineDebugger = ({
           !solver.failed &&
           solver.activeSubSolver !== null
         ) {
-          solver.step()
+          await stepSolver(solver as AsyncPipelineDebuggerSolver)
         }
       }
 
@@ -489,12 +703,12 @@ export const AutoroutingPipelineDebugger = ({
   }
 
   // Solve Sub function - steps until activeSubSolver of current phase changes or is solved
-  const handleSolveSub = () => {
+  const handleSolveSub = async () => {
     if (!solver.solved && !solver.failed) {
       const currentPhase = solver.activeSubSolver
       if (!currentPhase) {
         // No active phase, just step once
-        solver.step()
+        await stepSolver(solver as AsyncPipelineDebuggerSolver)
         setForceUpdate((prev) => prev + 1)
         return
       }
@@ -520,7 +734,7 @@ export const AutoroutingPipelineDebugger = ({
           break
         }
 
-        solver.step()
+        await stepSolver(solver as AsyncPipelineDebuggerSolver)
       }
 
       setForceUpdate((prev) => prev + 1)
@@ -529,10 +743,15 @@ export const AutoroutingPipelineDebugger = ({
   }
 
   // Solve completely
-  const handleSolveCompletely = () => {
+  const handleSolveCompletely = async () => {
     if (!solver.solved && !solver.failed) {
       const startTime = performance.now() / 1000
-      solver.solve()
+      await solveSolver(solver as AsyncPipelineDebuggerSolver, {
+        onProgress: async () => {
+          setForceUpdate((prev) => prev + 1)
+          await waitForNextPaint()
+        },
+      })
       const endTime = performance.now() / 1000
       setSolveTime(endTime - startTime)
     }
@@ -540,7 +759,7 @@ export const AutoroutingPipelineDebugger = ({
   }
 
   // Go to specific iteration
-  const handleGoToIteration = () => {
+  const handleGoToIteration = async () => {
     const targetIteration = window.prompt(
       "Enter target iteration number:",
       lastTargetIteration.toString(),
@@ -571,12 +790,12 @@ export const AutoroutingPipelineDebugger = ({
         !newSolver.solved &&
         !newSolver.failed
       ) {
-        newSolver.step()
+        await stepSolver(newSolver as AsyncPipelineDebuggerSolver)
       }
     } else {
       // We just need to run until we reach the target
       while (solver.iterations < target && !solver.solved && !solver.failed) {
-        solver.step()
+        await stepSolver(solver as AsyncPipelineDebuggerSolver)
       }
     }
 
@@ -684,15 +903,9 @@ export const AutoroutingPipelineDebugger = ({
 
         setDrcErrors(errorGraphics)
         setDrcErrorCount(allErrors.length)
-        alert(
-          `Found ${allErrors.length} ${mode === "relaxed" ? "relaxed " : ""}DRC errors. See the highlighted areas.`,
-        )
       } else {
         setDrcErrors(null)
         setDrcErrorCount(0)
-        alert(
-          `No ${mode === "relaxed" ? "relaxed " : ""}DRC errors found! All traces are properly spaced.`,
-        )
       }
     } catch (error) {
       console.error("DRC check error:", error)
@@ -706,6 +919,37 @@ export const AutoroutingPipelineDebugger = ({
 
   const handleRunDrcChecks = () => runDrcChecks("strict")
   const handleRunRelaxedDrcChecks = () => runDrcChecks("relaxed")
+
+  const handleTogglePcbSvg = () => {
+    if (pcbSvgMarkup) {
+      setPcbSvgMarkup(null)
+      return
+    }
+
+    if (!solver.solved || solver.failed) {
+      window.alert(
+        "Show PCB SVG is available after the routing problem is solved successfully.",
+      )
+      return
+    }
+
+    try {
+      const circuitJson = getCurrentCircuitJson(solver, (message) =>
+        window.alert(message),
+      )
+      if (!circuitJson) return
+
+      const svg = convertCircuitJsonToPcbSvg(circuitJson)
+      setPcbSvgMarkup(svg)
+    } catch (error) {
+      console.error("Failed to render PCB SVG:", error)
+      window.alert(
+        `Failed to render PCB SVG: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      )
+    }
+  }
 
   // Solve to Breakpoint logic
   const handleSolveToBreakpoint = (
@@ -721,7 +965,7 @@ export const AutoroutingPipelineDebugger = ({
     isSolvingToBreakpointRef.current = true
     setIsAnimating(false) // Ensure regular animation is stopped
 
-    const checkBreakpoint = () => {
+    const checkBreakpoint = async () => {
       if (!isSolvingToBreakpointRef.current) return // Stop if cancelled
 
       let deepestSolver = solver.activeSubSolver
@@ -758,19 +1002,23 @@ export const AutoroutingPipelineDebugger = ({
 
       // If breakpoint not hit, take a step
       if (!solver.solved && !solver.failed) {
-        solver.step()
+        await stepSolver(solver as AsyncPipelineDebuggerSolver)
         setForceUpdate((prev) => prev + 1) // Update UI after step
-        requestAnimationFrame(checkBreakpoint) // Continue checking in the next frame
+        requestAnimationFrame(() => {
+          void checkBreakpoint()
+        }) // Continue checking in the next frame
       } else {
         isSolvingToBreakpointRef.current = false // Solver finished or failed
       }
     }
 
-    requestAnimationFrame(checkBreakpoint) // Start the checking loop
+    requestAnimationFrame(() => {
+      void checkBreakpoint()
+    }) // Start the checking loop
   }
 
   // Play until a specific stage
-  const handlePlayStage = (targetSolverStageKey: string) => {
+  const handlePlayStage = async (targetSolverStageKey: string) => {
     if (solver.solved || solver.failed) return
 
     // Stop any ongoing animation or breakpoint solving
@@ -783,7 +1031,7 @@ export const AutoroutingPipelineDebugger = ({
       !solver.failed &&
       solver.activeSubSolver?.constructor.name !== targetSolverStageKey
     ) {
-      solver.step()
+      await stepSolver(solver as AsyncPipelineDebuggerSolver)
       // Check if the target solver became active *after* the step
       if (
         solver?.[
@@ -799,7 +1047,9 @@ export const AutoroutingPipelineDebugger = ({
     setForceUpdate((prev) => prev + 1) // Update UI
   }
 
-  const handleSolveUntilStageComplete = (targetSolverStageKey: string) => {
+  const handleSolveUntilStageComplete = async (
+    targetSolverStageKey: string,
+  ) => {
     if (solver.solved || solver.failed) return
 
     const targetStageIndex = solver.pipelineDef?.findIndex(
@@ -817,7 +1067,7 @@ export const AutoroutingPipelineDebugger = ({
       (solver.currentPipelineStepIndex ?? Number.POSITIVE_INFINITY) <=
         targetStageIndex
     ) {
-      solver.step()
+      await stepSolver(solver as AsyncPipelineDebuggerSolver)
     }
 
     setForceUpdate((prev) => prev + 1)
@@ -899,6 +1149,13 @@ export const AutoroutingPipelineDebugger = ({
         onSetCanSelectObjects={setCanSelectObjects}
         onRunDrcChecks={handleRunDrcChecks}
         onRunRelaxedDrcChecks={handleRunRelaxedDrcChecks}
+        canTogglePcbSvg={solver.solved && !solver.failed}
+        pcbSvgEnabled={Boolean(pcbSvgMarkup)}
+        onTogglePcbSvg={handleTogglePcbSvg}
+        autoSolve={autoSolve}
+        onSetAutoSolve={setAutoSolve}
+        autoRunDrc={autoRunDrc}
+        onSetAutoRunDrc={setAutoRunDrc}
         animationSpeed={speedLevel}
         onSetAnimationSpeed={setSpeedLevel}
         onSolveToBreakpointClick={() => {
@@ -921,6 +1178,7 @@ export const AutoroutingPipelineDebugger = ({
         onSetPipelineId={(pipelineId: PipelineId) => {
           setSelectedPipelineId(pipelineId)
           setLayerOverride("auto")
+          setPcbSvgMarkup(null)
           setSolver(
             createNewSolver({
               pipelineId,
@@ -930,23 +1188,28 @@ export const AutoroutingPipelineDebugger = ({
           setDrcErrors(null)
           setDrcErrorCount(0)
           setLastDrcMode(null)
+          autoRanDrcForSolveRef.current = false
         }}
         effort={effort}
         onSetEffort={(newEffort: EffortLevel) => {
           setEffort(newEffort)
+          setPcbSvgMarkup(null)
           setSolver(createNewSolver({ effort: newEffort }))
           setDrcErrors(null)
           setDrcErrorCount(0)
           setLastDrcMode(null)
+          autoRanDrcForSolveRef.current = false
         }}
         layerOverride={layerOverride}
         defaultLayerCount={srj.layerCount}
         onSetLayerOverride={(newLayerOverride: LayerOverride) => {
           setLayerOverride(newLayerOverride)
+          setPcbSvgMarkup(null)
           setSolver(createNewSolver({ layerOverride: newLayerOverride }))
           setDrcErrors(null)
           setDrcErrorCount(0)
           setLastDrcMode(null)
+          autoRanDrcForSolveRef.current = false
         }}
       />
       <div className="flex gap-2 mb-4 text-xs">
@@ -991,6 +1254,14 @@ export const AutoroutingPipelineDebugger = ({
         >
           Reset
         </button>
+        {pcbSvgMarkup && (
+          <button
+            className="border rounded-md p-2 hover:bg-gray-100"
+            onClick={() => setPcbSvgMarkup(null)}
+          >
+            Back to Solver Preview
+          </button>
+        )}
       </div>
 
       <div className="flex gap-4 mb-4 tabular-nums text-xs">
@@ -1075,27 +1346,35 @@ export const AutoroutingPipelineDebugger = ({
       />
 
       <div className="border rounded-md p-4 mb-4">
-        {canSelectObjects || renderer === "vector" ? (
-          <InteractiveGraphics
-            graphics={visualization}
-            onObjectClicked={({ object }) => {
-              if (!canSelectObjects) return
-              const objectLabel = object.label ?? ""
-              if (
-                !objectLabel.includes("cn") &&
-                !objectLabel.includes("cmn") &&
-                !objectLabel.includes("hd_node_marker")
-              )
-                return
-              setDialogObject(object)
-            }}
-            objectLimit={20e3}
-          />
+        {pcbSvgMarkup ? (
+          <div className="overflow-auto">
+            <div dangerouslySetInnerHTML={{ __html: pcbSvgMarkup }} />
+          </div>
         ) : (
-          <InteractiveGraphicsCanvas
-            graphics={visualization}
-            showLabelsByDefault={false}
-          />
+          <>
+            {canSelectObjects || renderer === "vector" ? (
+              <InteractiveGraphics
+                graphics={visualization}
+                onObjectClicked={({ object }) => {
+                  if (!canSelectObjects) return
+                  const objectLabel = object.label ?? ""
+                  if (
+                    !objectLabel.includes("cn") &&
+                    !objectLabel.includes("cmn") &&
+                    !objectLabel.includes("hd_node_marker")
+                  )
+                    return
+                  setDialogObject(object)
+                }}
+                objectLimit={20e3}
+              />
+            ) : (
+              <InteractiveGraphicsCanvas
+                graphics={visualization}
+                showLabelsByDefault={false}
+              />
+            )}
+          </>
         )}
       </div>
 
@@ -1130,41 +1409,10 @@ export const AutoroutingPipelineDebugger = ({
                           dialogObject.label.match(/cmn_(\d+)/)
                         if (match?.[0]) {
                           const nodeId = match[0]
-
-                          // Find the node in the solver's data
-                          let nodeData = null
-
-                          if (solver.nodeTargetMerger?.newNodes) {
-                            nodeData = solver.nodeTargetMerger.newNodes.find(
-                              (n: any) => n.capacityMeshNodeId === nodeId,
-                            )
-                          } else if (
-                            solver.nodeSolver &&
-                            "finishedNodes" in solver.nodeSolver
-                          ) {
-                            const finishedNodes = (solver.nodeSolver as any)
-                              .finishedNodes as Array<any> | undefined
-                            nodeData = finishedNodes?.find(
-                              (n: any) => n.capacityMeshNodeId === nodeId,
-                            )
-                          }
-
-                          // Get the node with port points from the portPointPathingSolver
-                          let nodeWithPortPoints = null
-                          if (
-                            solver.portPointPathingSolver
-                              ?.getNodesWithPortPoints
-                          ) {
-                            nodeWithPortPoints = solver
-                              .portPointPathingSolver!.getNodesWithPortPoints()
-                              .find((n: any) => n.capacityMeshNodeId === nodeId)
-                          }
-
-                          const dataToDownload = {
+                          const dataToDownload = getHighDensityNodeDownloadData(
+                            solver,
                             nodeId,
-                            capacityMeshNode: nodeData,
-                            nodeWithPortPoints: nodeWithPortPoints,
-                          }
+                          )
 
                           const dataStr = JSON.stringify(
                             dataToDownload,
@@ -1417,11 +1665,10 @@ export const AutoroutingPipelineDebugger = ({
         </button>
         <button
           onClick={() => {
-            const circuitJson = convertToCircuitJson(
-              solver.srjWithPointPairs!,
-              solver.getOutputSimplifiedPcbTraces(),
-              solver.srj.minTraceWidth,
+            const circuitJson = getCurrentCircuitJson(solver, (message) =>
+              window.alert(message),
             )
+            if (!circuitJson) return
             const blob = new Blob([JSON.stringify(circuitJson, null, 2)], {
               type: "application/json",
             })
