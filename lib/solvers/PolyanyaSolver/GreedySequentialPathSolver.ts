@@ -91,10 +91,12 @@ export class GreedySequentialPathSolver extends BaseSolver {
   }>
 
   /** Per-layer base obstacle polygons from original SRJ only (for resets) */
-  private baseObstaclePolygons: Point[][][]
+  /** Base obstacle polygons per layer (from SRJ obstacles). Public for debug rendering. */
+  baseObstaclePolygons: Point[][][]
 
   /** Per-layer rect obstacle polygons (base rects + via rects, merged before CDT) */
-  private rectObstacles: Point[][][] = []
+  /** Merged rect obstacle polygons per layer. Public for debug rendering. */
+  rectObstacles: Point[][][] = []
 
   /** Per-layer: connectedTo name arrays for each base obstacle polygon (parallel to baseObstaclePolygons) */
   private baseObstacleConnectedTo: string[][][] = []
@@ -107,7 +109,8 @@ export class GreedySequentialPathSolver extends BaseSolver {
   private connectionMeshCache: Map<string, Mesh | null>[] = []
 
   /** Per-layer trace obstacle polygons (thick polyline offsets, passed directly to CDT without merging) */
-  private tracePolygonObstacles: Point[][][] = []
+  /** Trace obstacle polygons per layer (from committed routes). Public for debug. */
+  tracePolygonObstacles: Point[][][] = []
 
   /** Cached AABBs for trace obstacle polygons (parallel to tracePolygonObstacles) */
   private tracePolyAABBs: {
@@ -124,7 +127,8 @@ export class GreedySequentialPathSolver extends BaseSolver {
   private traceWeightedRegions: WeightedRegion[][] = []
 
   /** Per-layer meshes */
-  private meshes: (Mesh | null)[] = []
+  /** Navigation meshes per layer. Public for debug rendering. */
+  meshes: (Mesh | null)[] = []
 
   /** Committed results */
   private resolvedPaths: ResolvedPath[] = []
