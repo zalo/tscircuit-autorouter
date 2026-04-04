@@ -85,7 +85,6 @@ export class GreedySequentialPipelineSolver extends BaseSolver {
         margin:
           (pps.srj.defaultObstacleMargin ?? pps.minTraceWidth) +
           pps.minTraceWidth / 2,
-        useOccupancyToggle: pps.opts.useOccupancyToggle,
       },
     ]),
     definePipelineStep("outputSolver", PolyanyaOutputSolver, (pps) => {
@@ -107,10 +106,7 @@ export class GreedySequentialPipelineSolver extends BaseSolver {
 
   constructor(
     public readonly srj: SimpleRouteJson,
-    public readonly opts: {
-      effort?: number
-      useOccupancyToggle?: boolean
-    } = {},
+    public readonly opts: { effort?: number } = {},
   ) {
     super()
     this.MAX_ITERATIONS = 100e6

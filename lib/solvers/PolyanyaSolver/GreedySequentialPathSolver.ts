@@ -91,12 +91,10 @@ export class GreedySequentialPathSolver extends BaseSolver {
   }>
 
   /** Per-layer base obstacle polygons from original SRJ only (for resets) */
-  /** Base obstacle polygons per layer (from SRJ obstacles). Public for debug rendering. */
-  baseObstaclePolygons: Point[][][]
+  private baseObstaclePolygons: Point[][][]
 
   /** Per-layer rect obstacle polygons (base rects + via rects, merged before CDT) */
-  /** Merged rect obstacle polygons per layer. Public for debug rendering. */
-  rectObstacles: Point[][][] = []
+  private rectObstacles: Point[][][] = []
 
   /** Per-layer: connectedTo name arrays for each base obstacle polygon (parallel to baseObstaclePolygons) */
   private baseObstacleConnectedTo: string[][][] = []
@@ -109,8 +107,7 @@ export class GreedySequentialPathSolver extends BaseSolver {
   private connectionMeshCache: Map<string, Mesh | null>[] = []
 
   /** Per-layer trace obstacle polygons (thick polyline offsets, passed directly to CDT without merging) */
-  /** Trace obstacle polygons per layer (from committed routes). Public for debug. */
-  tracePolygonObstacles: Point[][][] = []
+  private tracePolygonObstacles: Point[][][] = []
 
   /** Cached AABBs for trace obstacle polygons (parallel to tracePolygonObstacles) */
   private tracePolyAABBs: {
@@ -127,8 +124,7 @@ export class GreedySequentialPathSolver extends BaseSolver {
   private traceWeightedRegions: WeightedRegion[][] = []
 
   /** Per-layer meshes */
-  /** Navigation meshes per layer. Public for debug rendering. */
-  meshes: (Mesh | null)[] = []
+  private meshes: (Mesh | null)[] = []
 
   /** Committed results */
   private resolvedPaths: ResolvedPath[] = []
@@ -202,22 +198,6 @@ export class GreedySequentialPathSolver extends BaseSolver {
     }>
   } | null = null
 
-  /** When true, use Mesh.setObstacleBlocked() to toggle obstacle occupancy
-   *  instead of rebuilding the CDT per-connection (buildMeshExcluding).
-   *  Toggle approach: O(polygons) per connection, no CDT rebuild.
-   *  Exclusion approach: O(CDT) per connection, correct but slower. */
-  private useOccupancyToggle: boolean
-
-  /** Per-layer: maps connNames key → array of CDT obstacle indices to toggle.
-   *  Built once when the global mesh is constructed. */
-  private connObstacleIndices: Map<string, number[]>[] = []
-
-  /** Per-layer: maps "x,y" endpoint position → array of CDT obstacle indices
-   *  at that position (base obstacles + endpoint octagons).  Used by the
-   *  toggle approach to unblock only the specific obstacles at a connection's
-   *  start/end, not every obstacle on the same net. */
-  private endpointObstacleIndices: Map<string, number[]>[] = []
-
   constructor(params: {
     srj: SimpleRouteJson
     colorMap: Record<string, string>
@@ -225,7 +205,6 @@ export class GreedySequentialPathSolver extends BaseSolver {
     margin: number
     useObstacles?: boolean
     usePolyanya?: boolean
-    useOccupancyToggle?: boolean
   }) {
     super()
     this.srj = params.srj
@@ -233,7 +212,6 @@ export class GreedySequentialPathSolver extends BaseSolver {
     this.minTraceWidth = params.minTraceWidth
     this.margin = params.margin
     this.useObstacles = params.useObstacles ?? true
-    this.useOccupancyToggle = params.useOccupancyToggle ?? true
     this.usePolyanya = params.usePolyanya ?? true
     this.maxLayerCount = Math.max(1, params.srj.layerCount ?? 2)
     this.layerCount = Math.min(2, this.maxLayerCount) // Start with 2 layers for layer-aware routing
@@ -446,15 +424,6 @@ export class GreedySequentialPathSolver extends BaseSolver {
     this.remaining = [...this.allConnections]
     this.totalConnections = this.remaining.length
     this.MAX_ITERATIONS = Math.max(500, this.totalConnections * 10)
-
-    // Rebuild endpoint obstacle mappings now that allConnections is populated.
-    // The initial buildMesh calls in the constructor ran before allConnections
-    // existed, so endpointObstacleIndices was empty.
-    if (this.useOccupancyToggle) {
-      for (let z = 0; z < this.layerCount; z++) {
-        this.rebuildEndpointMapping(z)
-      }
-    }
   }
 
   /** Layer names based on maxLayerCount (stable even as layerCount grows) */
@@ -524,184 +493,6 @@ export class GreedySequentialPathSolver extends BaseSolver {
     if (this.connectionMeshCache[layerZ]) {
       this.connectionMeshCache[layerZ]!.clear()
     }
-
-    // Build obstacle-index → connNames mapping for occupancy toggle.
-    // allObstacles = mergedRects (from base+endpoint+via rects) + tracePolys.
-    // We need to know which CDT obstacle indices belong to which connection
-    // so we can toggle them with mesh.setObstacleBlocked().
-    //
-    // Since mergeOverlappingRects can change the mapping from the original
-    // rectObstacles, we use the baseObstacleConnectedTo as a lookup:
-    // for each obstacle index in the mesh, check if any allObstacles[i]
-    // centroid falls inside a known base obstacle polygon.
-    if (this.useOccupancyToggle) {
-      const map = new Map<string, number[]>()
-      const mesh = this.meshes[layerZ]!
-      const connectedToList = this.baseObstacleConnectedTo[layerZ]
-      const baseCount = this.baseObstacleCount[layerZ] ?? 0
-      const rects = this.rectObstacles[layerZ]!
-
-      // Map CDT obstacle index → net name for trace obstacles.
-      // Base obstacle matching is handled by endpoint proximity toggling.
-      for (const obsIdx of mesh.getObstacleIndices()) {
-        if (obsIdx < 0 || obsIdx >= allObstacles.length) continue
-        const tracePolyOffset = mergedRects.length
-        if (obsIdx >= tracePolyOffset) {
-          const tpIdx = obsIdx - tracePolyOffset
-          const traceNets = this.tracePolyNetNames[layerZ]!
-          if (tpIdx < traceNets.length) {
-            const netName = traceNets[tpIdx]!
-            let arr = map.get(netName)
-            if (!arr) { arr = []; map.set(netName, arr) }
-            arr.push(obsIdx)
-          }
-        }
-      }
-      this.connObstacleIndices[layerZ] = map
-
-      this.rebuildEndpointMapping(layerZ)
-    }
-  }
-
-  /** Rebuild endpoint → obstacle index mapping for a layer.
-   *  For each obstacle polygon in the mesh, checks which connection
-   *  endpoints fall inside it so only those specific obstacles get
-   *  unblocked when routing (not the entire net). */
-  private rebuildEndpointMapping(layerZ: number): void {
-    const mesh = this.meshes[layerZ]
-    if (!mesh) return
-    const conns = this.allConnections
-    if (!conns || conns.length === 0) return
-
-    const epMap = new Map<string, number[]>()
-    for (const obsIdx of mesh.getObstacleIndices()) {
-      // Check ALL mesh polygons with this obstacleIndex (obstacle may be
-      // decomposed into multiple triangles by the CDT).
-      for (const poly of mesh.polygons) {
-        if (poly.obstacleIndex !== obsIdx) continue
-        const verts = poly.vertices.map((vi) => mesh.vertices[vi]!.p)
-        for (const conn of conns) {
-          if (conn.startLayerZ === layerZ) {
-            const key = `${conn.originalStart.x},${conn.originalStart.y}`
-            if (this.pointInPolygon(conn.originalStart.x, conn.originalStart.y, verts)) {
-              let arr = epMap.get(key)
-              if (!arr) { arr = []; epMap.set(key, arr) }
-              if (!arr.includes(obsIdx)) arr.push(obsIdx)
-            }
-          }
-          if (conn.endLayerZ === layerZ) {
-            const key = `${conn.originalEnd.x},${conn.originalEnd.y}`
-            if (this.pointInPolygon(conn.originalEnd.x, conn.originalEnd.y, verts)) {
-              let arr = epMap.get(key)
-              if (!arr) { arr = []; epMap.set(key, arr) }
-              if (!arr.includes(obsIdx)) arr.push(obsIdx)
-            }
-          }
-        }
-      }
-    }
-    this.endpointObstacleIndices[layerZ] = epMap
-  }
-
-  /** Simple point-in-polygon test */
-  private pointInPolygon(px: number, py: number, poly: Point[]): boolean {
-    let inside = false
-    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-      const pi = poly[i]!, pj = poly[j]!
-      if ((pi.y > py) !== (pj.y > py) &&
-          px < (pj.x - pi.x) * (py - pi.y) / (pj.y - pi.y) + pi.x) {
-        inside = !inside
-      }
-    }
-    return inside
-  }
-
-  /**
-   * Toggle obstacle occupancy for a connection on the global mesh.
-   * Only unblocks the specific obstacles at the connection's start/end
-   * positions — NOT every obstacle on the same net.  This prevents
-   * traces from bridging through unrelated pads on the same net.
-   *
-   * Also toggles same-net trace obstacles (for multi-segment net routing).
-   */
-  private toggleConnectionObstacles(
-    layerZ: number,
-    conn: { originalStart: Point; originalEnd: Point; connNames: string[] },
-    baseNet: string,
-    blocked: boolean,
-  ): void {
-    const mesh = this.meshes[layerZ]
-    if (!mesh) return
-
-    // Endpoint radius for proximity matching.  Endpoint octagons may get
-    // merged into adjacent pad obstacles by mergeOverlappingRects, losing
-    // their individual identity.  So we directly unblock any CDT obstacle
-    // polygon whose centroid is within endpointClearance of the endpoint.
-    // Use batch API to avoid rebuilding vertex adjacency per-obstacle.
-    // One rebuild at the end is much faster than N rebuilds.
-    const endpointR = (this.minTraceWidth / 2 + this.margin) / Math.cos(Math.PI / 8)
-    const toggled = new Set<number>()
-
-    for (const pt of [conn.originalStart, conn.originalEnd]) {
-      for (let pi = 0; pi < mesh.polygons.length; pi++) {
-        const poly = mesh.polygons[pi]!
-        if (poly.obstacleIndex < 0) continue
-        if (toggled.has(poly.obstacleIndex)) continue
-        let cx = 0, cy = 0
-        for (const vi of poly.vertices) {
-          cx += mesh.vertices[vi]!.p.x
-          cy += mesh.vertices[vi]!.p.y
-        }
-        cx /= poly.vertices.length
-        cy /= poly.vertices.length
-        if (Math.hypot(cx - pt.x, cy - pt.y) < endpointR * 1.5) {
-          mesh.setObstacleBlockedBatch(poly.obstacleIndex, blocked)
-          toggled.add(poly.obstacleIndex)
-        }
-      }
-    }
-
-    // Same-net trace obstacles
-    const connMap = this.connObstacleIndices[layerZ]
-    if (connMap) {
-      const netIndices = connMap.get(baseNet)
-      if (netIndices) {
-        for (const idx of netIndices) {
-          if (!toggled.has(idx)) {
-            mesh.setObstacleBlockedBatch(idx, blocked)
-            toggled.add(idx)
-          }
-        }
-      }
-    }
-
-    const traceNets = this.tracePolyNetNames[layerZ]!
-    const tracePolys = this.tracePolygonObstacles[layerZ]!
-    for (let i = 0; i < traceNets.length; i++) {
-      if (traceNets[i] !== baseNet) continue
-      const tp = tracePolys[i]!
-      let tcx = 0, tcy = 0
-      for (const p of tp) { tcx += p.x; tcy += p.y }
-      tcx /= tp.length; tcy /= tp.length
-      for (let pi = 0; pi < mesh.polygons.length; pi++) {
-        const poly = mesh.polygons[pi]!
-        if (poly.obstacleIndex < 0 || toggled.has(poly.obstacleIndex)) continue
-        let cx = 0, cy = 0
-        for (const vi of poly.vertices) {
-          cx += mesh.vertices[vi]!.p.x
-          cy += mesh.vertices[vi]!.p.y
-        }
-        cx /= poly.vertices.length
-        cy /= poly.vertices.length
-        if (Math.hypot(cx - tcx, cy - tcy) < endpointR * 2) {
-          mesh.setObstacleBlockedBatch(poly.obstacleIndex, blocked)
-          toggled.add(poly.obstacleIndex)
-        }
-      }
-    }
-
-    // Single rebuild at the end (was N rebuilds before)
-    mesh.finishBlockedChanges()
   }
 
   /** Quick check: does this connection have any obstacles that would be
@@ -712,7 +503,7 @@ export class GreedySequentialPathSolver extends BaseSolver {
     connNames: string[],
     baseNet: string,
   ): boolean {
-    // Check base obstacles
+    // Check base obstacles (exact array element match, not substring)
     const connectedToList = this.baseObstacleConnectedTo[layerZ]
     const baseCount = this.baseObstacleCount[layerZ] ?? 0
     if (connectedToList) {
@@ -1107,14 +898,6 @@ export class GreedySequentialPathSolver extends BaseSolver {
     )
     this.meshes = Array.from({ length: this.layerCount }, () => null)
     this.connectionMeshCache = Array.from(
-      { length: this.layerCount },
-      () => new Map(),
-    )
-    this.connObstacleIndices = Array.from(
-      { length: this.layerCount },
-      () => new Map(),
-    )
-    this.endpointObstacleIndices = Array.from(
       { length: this.layerCount },
       () => new Map(),
     )
@@ -1605,37 +1388,28 @@ export class GreedySequentialPathSolver extends BaseSolver {
       const baseNet = GreedySequentialPathSolver.baseNetName(c.name)
 
       if (!needsVia) {
+        // Use nudge candidates on the global mesh for approximate cost
+        const starts =
+          c.startCandidates.length > 0 ? c.startCandidates : [c.start]
+        const ends = c.endCandidates.length > 0 ? c.endCandidates : [c.end]
         let bestApprox = pickShortest ? Infinity : -Infinity
         let found = false
-
-        if (this.useOccupancyToggle) {
-          // Toggle approach: unblock own obstacles, search on global mesh
-          this.toggleConnectionObstacles(layerZ, c, baseNet, false)
-          const r = this.searchPolyanya(mesh, c.originalStart, c.originalEnd)
-          this.toggleConnectionObstacles(layerZ, c, baseNet, true)
-          if (r.cost >= 0 && r.path.length > 0) {
-            bestApprox = r.cost
+        for (const s of starts) {
+          for (const e of ends) {
+            const r = this.usePolyanya
+              ? this.searchPolyanya(mesh, s, e)
+              : this.searchVG(mesh, layerZ, s, e)
+            if (r.cost < 0 || r.path.length === 0) continue
+            const better = pickShortest
+              ? r.cost < bestApprox
+              : r.cost > bestApprox
+            if (better) bestApprox = r.cost
             found = true
-          }
-        } else {
-          // Exclusion approach: nudge on global mesh for approximate cost
-          const starts =
-            c.startCandidates.length > 0 ? c.startCandidates : [c.start]
-          const ends = c.endCandidates.length > 0 ? c.endCandidates : [c.end]
-          for (const s of starts) {
-            for (const e of ends) {
-              const r = this.searchPolyanya(mesh, s, e)
-              if (r.cost < 0 || r.path.length === 0) continue
-              const better = pickShortest
-                ? r.cost < bestApprox
-                : r.cost > bestApprox
-              if (better) bestApprox = r.cost
-              found = true
             break
           }
           if (found) break
         }
-        } // end exclusion approach
+        // If nudge can't route on global mesh, use Euclidean as fallback estimate
         if (!found) {
           bestApprox = Math.hypot(
             c.originalEnd.x - c.originalStart.x,
@@ -1710,38 +1484,11 @@ export class GreedySequentialPathSolver extends BaseSolver {
     })
 
     // -------------------------------------------------------------------
-    // Phase 2: Commit the best routable candidate.
-    // Toggle approach: unblock own obstacles, search, re-block. No CDT rebuild.
-    // Exclusion approach: buildMeshExcluding CDT rebuild for the top candidate.
-    //
-    // After finding a path, validate it doesn't cross any committed trace
-    // on the same layer before returning.  This catches CDT leaks where
-    // the pathfinder routes through free-space gaps in obstacle polygons.
+    // Phase 2: Expensive verification — build exclusion mesh for top
+    // candidates only, pathfind from originalStart → originalEnd.
     // -------------------------------------------------------------------
-    // Helper: check if any point on the path is inside an unconnected obstacle
-    const pathPenetratesObstacle = (path: Point[], connNames: string[]): boolean => {
-      for (let i = 0; i < path.length - 1; i++) {
-        const a = path[i]!
-        const b = path[i + 1]!
-        for (let s = 0; s <= 5; s++) {
-          const t = s / 5
-          const px = a.x + (b.x - a.x) * t
-          const py = a.y + (b.y - a.y) * t
-          for (const obs of this.srj.obstacles) {
-            // Skip connected obstacles
-            if (connNames.some((cn) => obs.connectedTo.includes(cn))) continue
-            const hw = obs.width / 2
-            const hh = obs.height / 2
-            if (Math.abs(px - obs.center.x) < hw && Math.abs(py - obs.center.y) < hh) {
-              return true
-            }
-          }
-        }
-      }
-      return false
-    }
-
-    // Helper: check if a candidate path crosses any committed trace on this layer
+    // Post-pathfind validation: reject paths that cross committed traces
+    // or pass through unconnected obstacles.
     const pathCrosses = (path: Point[], exemptNet: string): boolean => {
       for (let i = 0; i < path.length - 1; i++) {
         const a = path[i]!
@@ -1752,63 +1499,48 @@ export class GreedySequentialPathSolver extends BaseSolver {
             const c = rp.route[j]!
             const d = rp.route[j + 1]!
             if (c.z !== layerZ || d.z !== layerZ) continue
-            if (segSegIntersection(a.x, a.y, b.x, b.y, c.x, c.y, d.x, d.y)) {
-              return true
-            }
+            if (segSegIntersection(a.x, a.y, b.x, b.y, c.x, c.y, d.x, d.y)) return true
           }
         }
       }
       return false
     }
+    const pathPenetratesObstacle = (path: Point[], connNames: string[]): boolean => {
+      for (let i = 0; i < path.length - 1; i++) {
+        const a = path[i]!
+        const b = path[i + 1]!
+        for (let s = 0; s <= 5; s++) {
+          const t = s / 5
+          const px = a.x + (b.x - a.x) * t
+          const py = a.y + (b.y - a.y) * t
+          for (const obs of this.srj.obstacles) {
+            if (connNames.some((cn) => obs.connectedTo.includes(cn))) continue
+            if (Math.abs(px - obs.center.x) < obs.width / 2 && Math.abs(py - obs.center.y) < obs.height / 2) return true
+          }
+        }
+      }
+      return false
+    }
+    const pathIsValid = (path: Point[], connNames: string[], baseNet: string): boolean =>
+      !pathCrosses(path, baseNet) && !pathPenetratesObstacle(path, connNames)
 
     for (const cand of ranked) {
-      // In toggle mode, also try non-routable candidates via CDT fallback
-      // (toggle may fail due to NOT_ON_MESH when endpoint octagons are merged)
-      if (!cand.routable && !this.useOccupancyToggle) continue
       const c = cand.conn
       const baseNet = GreedySequentialPathSolver.baseNetName(c.name)
 
       if (!cand.needsVia) {
-        let r: { cost: number; path: Point[] } = { cost: -1, path: [] }
-        if (this.useOccupancyToggle) {
-          this.toggleConnectionObstacles(layerZ, c, baseNet, false)
-          r = this.searchPolyanya(mesh, c.originalStart, c.originalEnd)
-          this.toggleConnectionObstacles(layerZ, c, baseNet, true)
-        } else {
-          const connMesh = this.buildMeshExcluding(layerZ, c.connNames)
-          if (connMesh) r = this.searchPolyanya(connMesh, c.originalStart, c.originalEnd)
-        }
-        // If toggle fails (no path or crossing), fallback to CDT exclusion
-        // (different mesh topology — no obstacle holes at endpoints)
-        const toggleFailed = r.cost < 0 || r.path.length === 0
-        const toggleCrosses = !toggleFailed && pathCrosses(r.path, baseNet)
-        const togglePenetrates = !toggleFailed && !toggleCrosses && pathPenetratesObstacle(r.path, c.connNames)
-        if ((toggleFailed || toggleCrosses || togglePenetrates) && this.useOccupancyToggle) {
-          const connMesh = this.buildMeshExcluding(layerZ, c.connNames)
-          if (connMesh) r = this.searchPolyanya(connMesh, c.originalStart, c.originalEnd)
-        }
-        if (r.cost >= 0 && r.path.length > 0 && !pathCrosses(r.path, baseNet) && !pathPenetratesObstacle(r.path, c.connNames)) {
+        const connMesh = this.buildMeshExcluding(layerZ, c.connNames)
+        if (!connMesh) continue
+        const r = this.searchPolyanya(connMesh, c.originalStart, c.originalEnd)
+        if (r.cost >= 0 && r.path.length > 0 && pathIsValid(r.path, c.connNames, baseNet)) {
           this.remaining[cand.idx]!.start = c.originalStart
           this.remaining[cand.idx]!.end = c.originalEnd
           return { idx: cand.idx, path: r.path }
         }
-      } else if (cand.effectiveS && cand.effectiveE) {
-        let r: { cost: number; path: Point[] } = { cost: -1, path: [] }
-        if (this.useOccupancyToggle) {
-          this.toggleConnectionObstacles(layerZ, c, baseNet, false)
-          r = this.searchPolyanya(mesh, cand.effectiveS, cand.effectiveE)
-          this.toggleConnectionObstacles(layerZ, c, baseNet, true)
-        } else {
-          const connMesh = this.buildMeshExcluding(layerZ, c.connNames) ?? mesh
-          r = this.searchPolyanya(connMesh, cand.effectiveS, cand.effectiveE)
-        }
-        const viaFailed = r.cost < 0 || r.path.length === 0
-        const viaCrosses = !viaFailed && pathCrosses(r.path, baseNet)
-        if ((viaFailed || viaCrosses) && this.useOccupancyToggle) {
-          const connMesh = this.buildMeshExcluding(layerZ, c.connNames) ?? mesh
-          r = this.searchPolyanya(connMesh, cand.effectiveS, cand.effectiveE)
-        }
-        if (r.cost >= 0 && r.path.length > 0 && !pathCrosses(r.path, baseNet) && !pathPenetratesObstacle(r.path, c.connNames)) {
+      } else if (cand.routable && cand.effectiveS && cand.effectiveE) {
+        const connMesh = this.buildMeshExcluding(layerZ, c.connNames) ?? mesh
+        const r = this.searchPolyanya(connMesh, cand.effectiveS, cand.effectiveE)
+        if (r.cost >= 0 && r.path.length > 0 && pathIsValid(r.path, c.connNames, baseNet)) {
           this.remaining[cand.idx]!.start = cand.effectiveS
           this.remaining[cand.idx]!.end = cand.effectiveE
           return { idx: cand.idx, path: r.path }
@@ -2342,71 +2074,36 @@ export class GreedySequentialPathSolver extends BaseSolver {
       }
     }
 
-    // Draw convex region map (layer 0): filled polygons colored by state
-    const mesh = this.meshes[0]
-    if (mesh) {
-      const rects: GraphicsObject["rects"] = []
-      for (let pi = 0; pi < mesh.polygons.length; pi++) {
-        const polygon = mesh.polygons[pi]!
-        if (polygon.vertices.length < 3) continue
-
-        // Compute AABB for the rect visualization
-        let minPx = Infinity
-        let minPy = Infinity
-        let maxPx = -Infinity
-        let maxPy = -Infinity
-        const polyPts: { x: number; y: number }[] = []
-        for (const vIdx of polygon.vertices) {
-          const v = mesh.vertices[vIdx]
-          if (!v) continue
-          polyPts.push({ x: v.p.x, y: v.p.y })
-          if (v.p.x < minPx) minPx = v.p.x
-          if (v.p.y < minPy) minPy = v.p.y
-          if (v.p.x > maxPx) maxPx = v.p.x
-          if (v.p.y > maxPy) maxPy = v.p.y
-        }
-
-        // Draw polygon outline with color based on state
-        const isBlocked = polygon.blocked
-        const isObstacle = polygon.obstacleIndex >= 0
-
-        // Color: blocked obstacles = red fill, free space = faint blue,
-        // unblocked obstacles = green (shouldn't normally appear during viz)
-        const fillColor = isBlocked
-          ? "rgba(255,60,60,0.15)"
-          : isObstacle
-            ? "rgba(60,255,60,0.1)"
-            : "rgba(80,120,255,0.04)"
-
-        const strokeColor = isBlocked
-          ? "rgba(255,80,80,0.5)"
-          : isObstacle
-            ? "rgba(60,200,60,0.3)"
-            : "rgba(100,100,255,0.2)"
-
-        // Draw as closed polyline (more accurate than rect for non-axis-aligned)
-        if (polyPts.length >= 3) {
-          const closedPts = [...polyPts, { ...polyPts[0]! }]
-          lines.push({
-            points: closedPts,
-            strokeColor,
-            strokeWidth: isBlocked ? 0.06 : 0.02,
-          })
-        }
-      }
-    }
-
-    // Draw trace obstacle polygon outlines (thicker, on top)
+    // Draw trace obstacle polygon outlines
     for (const tp of this.traceObstaclePolys) {
       const color = this.colorMap[tp.connectionName] ?? "green"
-      const alpha = tp.layerZ === 0 ? 0.6 : 0.3
+      const alpha = tp.layerZ === 0 ? 0.4 : 0.2
       if (tp.polygon.length >= 3) {
         const pts = tp.polygon.map((p) => ({ x: p.x, y: p.y }))
         pts.push({ ...pts[0]! }) // close the polygon
         lines.push({
           points: pts,
           strokeColor: this.withAlpha(color, alpha),
-          strokeWidth: 0.05,
+          strokeWidth: 0.02,
+        })
+      }
+    }
+
+    // Draw mesh edges (layer 0 only for clarity)
+    const mesh = this.meshes[0]
+    if (mesh) {
+      for (const polygon of mesh.polygons) {
+        if (polygon.vertices.length < 2) continue
+        const pts: { x: number; y: number }[] = []
+        for (const vIdx of polygon.vertices) {
+          const v = mesh.vertices[vIdx]
+          if (v) pts.push({ x: v.p.x, y: v.p.y })
+        }
+        if (pts.length > 0) pts.push({ ...pts[0]! })
+        lines.push({
+          points: pts,
+          strokeColor: "rgba(100,100,255,0.4)",
+          strokeWidth: 0.03,
         })
       }
     }
